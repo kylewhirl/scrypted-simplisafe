@@ -445,7 +445,7 @@ class SimplisafeApi {
             });
             this.lastSubscription = {
                 id: subscriptionId,
-                data: subscription?.subscription ?? subscription,
+                data: subscription,
                 timestamp: Date.now(),
             };
         }
