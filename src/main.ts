@@ -5,6 +5,7 @@ import sdk, {
     DeviceProvider,
     FFmpegInput,
     MediaObject,
+    MotionSensor,
     RequestMediaStreamOptions,
     RequestPictureOptions,
     ResponseMediaStreamOptions,
@@ -23,6 +24,7 @@ import { EventEmitter } from 'events';
 import crypto from 'crypto';
 import { lookup } from 'dns/promises';
 import jpegExtract from 'jpeg-extract';
+import WebSocket, { RawData } from 'ws';
 
 const { deviceManager, mediaManager, systemManager } = sdk;
 
@@ -43,6 +45,9 @@ const cameraCacheTime = 15000;
 const rateLimitInitialInterval = 60_000;
 const rateLimitMaxInterval = 2 * 60 * 60 * 1000;
 const mediaHostTtl = 5 * 60 * 1000;
+const socketRetryInterval = 1000;
+const socketHeartbeatInterval = 60_000;
+const socketRetryBackoffCap = 60_000;
 const RESOLUTION_INTERFACE: ScryptedInterface | string = (ScryptedInterface as any).Resolution ?? 'Resolution';
 
 const ssOAuth: AxiosInstance = axios.create({
@@ -53,6 +58,11 @@ axiosRetry(ssOAuth, { retries: 3 });
 export const AUTH_EVENTS = {
     REFRESH_CREDENTIALS_SUCCESS: 'REFRESH_CREDENTIALS_SUCCESS',
     REFRESH_CREDENTIALS_FAILURE: 'REFRESH_CREDENTIALS_FAILURE',
+} as const;
+
+export const EVENT_TYPES = {
+    CAMERA_MOTION: 'CAMERA_MOTION',
+    DOORBELL: 'DOORBELL',
 } as const;
 
 class RateLimitError extends Error {
@@ -94,6 +104,33 @@ interface SimplisafeCameraDetails {
 }
 
 type DebugProvider = () => boolean;
+
+interface SimplisafeRealtimeInternalDetails {
+    mainCamera?: string;
+    [key: string]: unknown;
+}
+
+export interface SimplisafeRealtimeEvent {
+    sid?: string;
+    eventCid?: number;
+    sensorSerial?: string;
+    cameraSerial?: string;
+    serial?: string;
+    deviceSerial?: string;
+    cameraUuid?: string;
+    uuid?: string;
+    detectedAt?: string | number;
+    timestamp?: string | number;
+    internal?: SimplisafeRealtimeInternalDetails;
+    [key: string]: unknown;
+}
+
+interface SimplisafeRealtimeMessage {
+    source?: string;
+    type?: string;
+    data?: SimplisafeRealtimeEvent;
+    [key: string]: unknown;
+}
 
 function normalizeIdSegment(value: string): string {
     return value
@@ -332,7 +369,7 @@ class SimplisafeAuthManager extends EventEmitter {
     }
 }
 
-class SimplisafeApi {
+class SimplisafeApi extends EventEmitter {
     private readonly authManager: SimplisafeAuthManager;
     private readonly log: Console;
     private readonly axios: AxiosInstance;
@@ -345,8 +382,16 @@ class SimplisafeApi {
     private isBlocked = false;
     private nextAttempt = 0;
     private nextBlockInterval = rateLimitInitialInterval;
+    private socket?: WebSocket;
+    private socketHeartbeat?: NodeJS.Timeout;
+    private socketReconnect?: NodeJS.Timeout;
+    private socketAlive = false;
+    private isAwaitingSocketReconnect = false;
+    private socketAttempts = 0;
+    private socketJoinTarget?: string;
 
     constructor(authManager: SimplisafeAuthManager, log: Console, debug: boolean) {
+        super();
         this.authManager = authManager;
         this.log = log;
         this.debug = debug;
@@ -354,6 +399,13 @@ class SimplisafeApi {
             baseURL: 'https://api.simplisafe.com/v1',
         });
         axiosRetry(this.axios, { retries: 2 });
+
+        this.authManager.on(AUTH_EVENTS.REFRESH_CREDENTIALS_SUCCESS, () => {
+            this.identifySocket();
+        });
+        this.authManager.on(AUTH_EVENTS.REFRESH_CREDENTIALS_FAILURE, () => {
+            this.handleSocketConnectionFailure('auth');
+        });
     }
 
     setDebug(debug: boolean): void {
@@ -370,6 +422,272 @@ class SimplisafeApi {
         this.userId = undefined;
         this.lastSubscription = undefined;
         this.cameraCache = undefined;
+    }
+
+    async startListening(): Promise<void> {
+        if (this.socket && (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)) {
+            this.identifySocket();
+            return;
+        }
+
+        if (this.isAwaitingSocketReconnect) {
+            return;
+        }
+
+        try {
+            if (!this.authManager.isAuthenticated()) {
+                await this.authManager.refreshCredentials();
+            }
+        } catch (err) {
+            if (this.debug) {
+                this.log.warn('SimpliSafe realtime: authentication unavailable, skipping websocket connection.', err);
+            }
+            throw err;
+        }
+
+        try {
+            const userId = await this.getUserId();
+            if (!this.subId) {
+                await this.getSubscription();
+            }
+            this.socketJoinTarget = `uid:${userId}`;
+        } catch (err) {
+            if (this.debug) {
+                this.log.warn('SimpliSafe realtime: unable to determine subscription details.', err);
+            }
+            throw err;
+        }
+
+        this.openSocket();
+    }
+
+    stopListening(): void {
+        this.cleanupSocket();
+        if (this.socketReconnect) {
+            clearTimeout(this.socketReconnect);
+            this.socketReconnect = undefined;
+        }
+        this.isAwaitingSocketReconnect = false;
+        this.socketAttempts = 0;
+    }
+
+    private openSocket(): void {
+        if (!this.authManager.accessToken) {
+            if (this.debug) {
+                this.log.warn('SimpliSafe realtime: skipping websocket connection due to missing access token.');
+            }
+            return;
+        }
+
+        this.cleanupSocket();
+        this.isAwaitingSocketReconnect = false;
+
+        try {
+            this.socket = new WebSocket('wss://socketlink.prd.aser.simplisafe.com', {
+                handshakeTimeout: 5000,
+            });
+        } catch (err) {
+            this.handleSocketConnectionFailure('construct');
+            if (this.debug) {
+                this.log.error('SimpliSafe realtime: failed to create websocket.', err);
+            }
+            return;
+        }
+
+        const socket = this.socket;
+        socket.on('open', () => {
+            if (this.debug) {
+                this.log.log('SimpliSafe realtime socket opened.');
+            }
+            this.socketAttempts = 0;
+            this.identifySocket();
+        });
+        socket.on('close', () => {
+            if (this.debug) {
+                this.log.warn('SimpliSafe realtime socket closed.');
+            }
+            this.handleSocketConnectionFailure('close');
+        });
+        socket.on('error', (error: unknown) => {
+            if (this.debug) {
+                this.log.warn('SimpliSafe realtime socket error.', error);
+            }
+            this.handleSocketConnectionFailure('error');
+        });
+        socket.on('unexpected-response', (error: unknown) => {
+            if (this.debug) {
+                this.log.warn('SimpliSafe realtime socket unexpected response.', error);
+            }
+            this.handleSocketConnectionFailure('unexpected');
+        });
+        socket.on('pong', () => {
+            this.socketAlive = true;
+        });
+        socket.on('message', (message: RawData) => this.handleSocketMessage(message));
+    }
+
+    private identifySocket(): void {
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        const token = this.authManager.accessToken;
+        if (!token) {
+            return;
+        }
+        const join = this.socketJoinTarget ? [this.socketJoinTarget] : [];
+        const payload = {
+            datacontenttype: 'application/json',
+            type: 'com.simplisafe.connection.identify',
+            time: new Date().toISOString(),
+            id: `ts:${Date.now()}`,
+            specversion: '1.0',
+            source: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Safari/605.1.15',
+            data: {
+                auth: {
+                    schema: 'bearer',
+                    token,
+                },
+                join,
+            },
+        };
+        try {
+            this.socket.send(JSON.stringify(payload));
+        } catch (err) {
+            if (this.debug) {
+                this.log.warn('SimpliSafe realtime: identify send failed.', err);
+            }
+            this.handleSocketConnectionFailure('identify');
+        }
+    }
+
+    private handleSocketMessage(raw: RawData): void {
+        let message: SimplisafeRealtimeMessage;
+        try {
+            message = JSON.parse(raw.toString());
+        } catch (err) {
+            if (this.debug) {
+                this.log.warn('SimpliSafe realtime: failed to parse message.', err);
+            }
+            return;
+        }
+
+        if (message.source === 'service') {
+            switch (message.type) {
+            case 'com.simplisafe.service.hello':
+            case 'com.simplisafe.service.registered':
+                break;
+            case 'com.simplisafe.namespace.subscribed':
+                this.socketAlive = true;
+                this.scheduleHeartbeat();
+                if (this.debug) {
+                    this.log.log('SimpliSafe realtime events connected.');
+                }
+                break;
+            default:
+                if (this.debug) {
+                    this.log.log('SimpliSafe realtime: unhandled service message.', message);
+                }
+                break;
+            }
+            return;
+        }
+
+        if (message.source !== 'messagequeue') {
+            return;
+        }
+
+        const data = message.data;
+        if (!data) {
+            return;
+        }
+
+        if (data.sid && this.subId && data.sid !== this.subId) {
+            return;
+        }
+
+        switch (data.eventCid) {
+        case 1170:
+            this.emit(EVENT_TYPES.CAMERA_MOTION, data);
+            break;
+        case 1458:
+            this.emit(EVENT_TYPES.DOORBELL, data);
+            break;
+        default:
+            break;
+        }
+    }
+
+    private scheduleHeartbeat(): void {
+        if (this.socketHeartbeat) {
+            clearInterval(this.socketHeartbeat);
+        }
+        if (!this.socket) {
+            return;
+        }
+        this.socketAlive = true;
+        this.socketHeartbeat = setInterval(() => {
+            if (!this.socket) {
+                return;
+            }
+            if (!this.socketAlive) {
+                if (this.debug) {
+                    this.log.warn('SimpliSafe realtime heartbeat missed.');
+                }
+                this.handleSocketConnectionFailure('heartbeat');
+                return;
+            }
+            this.socketAlive = false;
+            try {
+                this.socket.ping();
+            } catch (err) {
+                if (this.debug) {
+                    this.log.warn('SimpliSafe realtime heartbeat ping failed.', err);
+                }
+                this.handleSocketConnectionFailure('heartbeat');
+            }
+        }, Math.min(socketHeartbeatInterval + 5000 * Math.random(), socketHeartbeatInterval * 2));
+    }
+
+    private cleanupSocket(): void {
+        if (this.socketHeartbeat) {
+            clearInterval(this.socketHeartbeat);
+            this.socketHeartbeat = undefined;
+        }
+        if (this.socketReconnect) {
+            clearTimeout(this.socketReconnect);
+            this.socketReconnect = undefined;
+        }
+        const socket = this.socket;
+        if (socket) {
+            try {
+                socket.removeAllListeners();
+                socket.terminate();
+            } catch (err) {
+                if (this.debug) {
+                    this.log.warn('SimpliSafe realtime: error closing socket.', err);
+                }
+            }
+        }
+        this.socket = undefined;
+        this.socketAlive = false;
+    }
+
+    private handleSocketConnectionFailure(reason: string): void {
+        this.cleanupSocket();
+        if (this.isAwaitingSocketReconnect) {
+            return;
+        }
+        this.isAwaitingSocketReconnect = true;
+        const attempt = this.socketAttempts++;
+        const delay = Math.min((2 ** attempt) * socketRetryInterval, socketRetryBackoffCap);
+        this.socketReconnect = setTimeout(() => {
+            this.isAwaitingSocketReconnect = false;
+            void this.startListening().catch(err => {
+                if (this.debug) {
+                    this.log.warn(`SimpliSafe realtime: reconnect failed after ${reason}.`, err);
+                }
+            });
+        }, delay);
     }
 
     async getAccessToken(): Promise<string> {
@@ -555,7 +873,7 @@ class SimplisafeApi {
     }
 }
 
-class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Settings {
+class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Settings, MotionSensor {
     private static instanceRegistry = new Map<string, string>();
     private readonly nativeCameraId: string;
     private readonly api: SimplisafeApi;
@@ -572,6 +890,10 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     private simplisafeUuid?: string;
     private ready = false;
     private desiredOnline = true;
+    private motionResetTimer?: NodeJS.Timeout;
+    private readonly motionHoldDurationMs = 5_000;
+    motionDetected?: boolean;
+    motionDetectedTimestamp?: number;
 
     constructor(
         nativeId: string,
@@ -591,6 +913,7 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
         this.detailsCallback = detailsCallback;
         this.statusCallback = statusCallback;
         this.instanceId = Math.random().toString(36).slice(2);
+        this.motionDetected = false;
 
         const existing = SimplisafeCamera.instanceRegistry.get(nativeId);
         if (existing && existing !== this.instanceId) {
@@ -612,6 +935,10 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
         const current = SimplisafeCamera.instanceRegistry.get(this.nativeCameraId);
         if (current === this.instanceId) {
             SimplisafeCamera.instanceRegistry.delete(this.nativeCameraId);
+        }
+        if (this.motionResetTimer) {
+            clearTimeout(this.motionResetTimer);
+            this.motionResetTimer = undefined;
         }
     }
     updateDetails(details: SimplisafeCameraDetails): void {
@@ -680,6 +1007,37 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
 
     isStreamingReady(): boolean {
         return this.ready;
+    }
+
+    handleMotionEvent(event: SimplisafeRealtimeEvent): void {
+        this.logInstanceUsage('motionEvent');
+        const timestampCandidates: (number | undefined)[] = [];
+        if (typeof event?.timestamp === 'number') {
+            timestampCandidates.push(event.timestamp);
+        }
+        if (typeof event?.detectedAt === 'number') {
+            timestampCandidates.push(event.detectedAt);
+        } else if (typeof event?.detectedAt === 'string') {
+            const parsed = Date.parse(event.detectedAt);
+            if (!Number.isNaN(parsed)) {
+                timestampCandidates.push(parsed);
+            }
+        }
+        const now = Date.now();
+        const chosenTimestamp = timestampCandidates.find(value => typeof value === 'number' && Number.isFinite(value)) ?? now;
+        this.motionDetectedTimestamp = chosenTimestamp;
+        if (this.getDebug()) {
+            this.console.log(`SimpliSafe motion detected for ${this.nativeCameraId} at ${new Date(chosenTimestamp).toISOString()}.`);
+        }
+
+        this.motionDetected = true;
+        if (this.motionResetTimer) {
+            clearTimeout(this.motionResetTimer);
+        }
+        this.motionResetTimer = setTimeout(() => {
+            this.motionResetTimer = undefined;
+            this.motionDetected = false;
+        }, this.motionHoldDurationMs);
     }
 
     async prepareForStreaming(): Promise<boolean> {
@@ -969,6 +1327,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         this.authManager = new SimplisafeAuthManager(this.storage, this.console, this.debug);
         this.api = new SimplisafeApi(this.authManager, this.console, this.debug);
         this.api.setAccountNumber(this.accountNumber);
+        this.api.on(EVENT_TYPES.CAMERA_MOTION, event => this.handleCameraMotionEvent(event));
 
         this.loadCachedCameras();
         this.maintenanceCleanup();
@@ -977,6 +1336,100 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
 
     private normalizeNativeId(id: string): string {
         return (id ?? '').trim().toLowerCase();
+    }
+
+    private associateUuidWithNativeId(uuid: string | undefined, nativeId: string): void {
+        if (!uuid) {
+            return;
+        }
+        this.uuidToNativeId.set(uuid, nativeId);
+        this.uuidToNativeId.set(uuid.toLowerCase(), nativeId);
+    }
+
+    private removeUuidAssociation(uuid: string | undefined): void {
+        if (!uuid) {
+            return;
+        }
+        this.uuidToNativeId.delete(uuid);
+        this.uuidToNativeId.delete(uuid.toLowerCase());
+    }
+
+    private handleCameraMotionEvent(event: SimplisafeRealtimeEvent): void {
+        const nativeIds = this.resolveNativeIdsFromEvent(event);
+        if (nativeIds.length === 0) {
+            if (this.debug) {
+                const identifier = event.sensorSerial
+                    || event.cameraSerial
+                    || event.serial
+                    || event.deviceSerial
+                    || event.cameraUuid
+                    || event.uuid;
+                this.console.warn(`SimpliSafe motion event could not be matched to a camera. identifier=${identifier ?? 'unknown'}`);
+            }
+            return;
+        }
+
+        for (const nativeId of nativeIds) {
+            void this.dispatchMotionEvent(nativeId, event);
+        }
+    }
+
+    private resolveNativeIdsFromEvent(event: SimplisafeRealtimeEvent): string[] {
+        const candidates = new Set<string>();
+        const collect = (value?: string) => {
+            if (typeof value === 'string') {
+                const trimmed = value.trim();
+                if (trimmed) {
+                    candidates.add(trimmed);
+                }
+            }
+        };
+        collect(event.sensorSerial);
+        collect(event.cameraSerial);
+        collect(event.serial);
+        collect(event.deviceSerial);
+        collect(event.cameraUuid);
+        collect(event.uuid);
+        if (event.internal && typeof event.internal === 'object') {
+            const internal = event.internal as SimplisafeRealtimeInternalDetails;
+            collect(internal.mainCamera);
+        }
+
+        const resolved = new Set<string>();
+        for (const candidate of candidates) {
+            const normalized = this.normalizeNativeId(candidate);
+            if (this.cameraDetails.has(normalized)) {
+                resolved.add(normalized);
+            }
+            const mapped = this.uuidToNativeId.get(candidate) ?? this.uuidToNativeId.get(candidate.toLowerCase());
+            if (mapped) {
+                resolved.add(mapped);
+            }
+        }
+
+        return Array.from(resolved);
+    }
+
+    private async dispatchMotionEvent(nativeId: string, event: SimplisafeRealtimeEvent): Promise<void> {
+        try {
+            const device = this.devices.get(nativeId) ?? await this.getDevice(nativeId);
+            device.handleMotionEvent(event);
+        } catch (err) {
+            this.console.warn(`SimpliSafe motion event dispatch failed for ${nativeId}.`, err);
+        }
+    }
+
+    private async startRealtimeEvents(): Promise<void> {
+        if (!this.authManager.hasRefreshToken()) {
+            return;
+        }
+        try {
+            await this.api.startListening();
+        } catch (err) {
+            if (this.debug) {
+                this.console.warn('SimpliSafe realtime events unavailable.', err);
+            }
+        }
     }
 
     private scheduleRefreshDescriptor(nativeId: string, delayMs = 500): void {
@@ -1041,6 +1494,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
             ScryptedInterface.Settings,
             RESOLUTION_INTERFACE,
             ScryptedInterface.Online,
+            ScryptedInterface.MotionSensor,
         ];
 
         if (includeVideoCamera) {
@@ -1153,14 +1607,14 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         const normalized = this.normalizeNativeId(nativeId);
         const previousUuid = this.nativeIdToUuid.get(normalized);
         if (previousUuid && previousUuid !== details.uuid) {
-            this.uuidToNativeId.delete(previousUuid);
+            this.removeUuidAssociation(previousUuid);
         }
 
         this.cameraDetails.set(normalized, details);
 
         if (details.uuid) {
             this.nativeIdToUuid.set(normalized, details.uuid);
-            this.uuidToNativeId.set(details.uuid, normalized);
+            this.associateUuidWithNativeId(details.uuid, normalized);
         } else {
             this.nativeIdToUuid.delete(normalized);
         }
@@ -1264,6 +1718,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         try {
             this.console.log('SimpliSafe plugin initialization: syncing devices.');
             await this.syncDevices();
+            await this.startRealtimeEvents();
             this.console.log('SimpliSafe plugin initialization completed.');
         } catch (err) {
             this.console.error('Failed to initialize SimpliSafe cameras.', err);
@@ -1289,7 +1744,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 this.cameraDetails.set(nativeId, camera);
                 if (camera.uuid) {
                     this.nativeIdToUuid.set(nativeId, camera.uuid);
-                    this.uuidToNativeId.set(camera.uuid, nativeId);
+                    this.associateUuidWithNativeId(camera.uuid, nativeId);
                 }
             }
         } catch (err) {
@@ -1341,13 +1796,13 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
             if (!simplisafeUuid && details.uuid) {
                 simplisafeUuid = details.uuid;
                 this.nativeIdToUuid.set(lookupNativeId, simplisafeUuid);
-                this.uuidToNativeId.set(simplisafeUuid, lookupNativeId);
+                this.associateUuidWithNativeId(simplisafeUuid, lookupNativeId);
             }
             this.console.warn(`SimpliSafe camera ${lookupNativeId} is missing metadata. Initializing with placeholder configuration.`);
         } else if (!simplisafeUuid && details.uuid) {
             simplisafeUuid = details.uuid;
             this.nativeIdToUuid.set(lookupNativeId, simplisafeUuid);
-            this.uuidToNativeId.set(simplisafeUuid, lookupNativeId);
+            this.associateUuidWithNativeId(simplisafeUuid, lookupNativeId);
         }
 
         const device = new SimplisafeCamera(
@@ -1486,6 +1941,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         }
         await this.authManager.refreshCredentials();
         await this.syncDevices(true);
+        await this.startRealtimeEvents();
     }
 
     private async syncDevices(forceRefresh = false): Promise<void> {
@@ -1553,7 +2009,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
             for (const legacy of existing) {
                 const uuid = this.nativeIdToUuid.get(legacy);
                 if (uuid) {
-                    this.uuidToNativeId.delete(uuid);
+                    this.removeUuidAssociation(uuid);
                 }
                 this.nativeIdToUuid.delete(legacy);
                 this.cameraDetails.delete(legacy);
@@ -1586,6 +2042,8 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
             for (const nativeId of this.cameraDetails.keys()) {
                 this.scheduleReadinessEvaluation(nativeId);
             }
+
+            await this.startRealtimeEvents();
         } catch (err) {
             this.console.error('Failed to refresh SimpliSafe cameras.', err);
             throw err;
