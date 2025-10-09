@@ -2,6 +2,21 @@
    "name": "@kylewhirl/scrypted-simplisafe",
    "version": "0.1.2",
    "description": "Simplisafe integration for Scrypted",
+   "license": "Apache",
+   "repository": {
+      "type": "git",
+      "url": "git+https://github.com/kylewhirl/scrypted-simplisafe.git"
+   },
+   "bugs": {
+      "url": "https://github.com/kylewhirl/scrypted-simplisafe/issues"
+   },
+   "homepage": "https://github.com/kylewhirl/scrypted-simplisafe",
+   "keywords": [
+      "scrypted",
+      "plugin",
+      "simplisafe",
+      "camera"
+   ],
    "type": "commonjs",
    "main": "out/main.nodejs.js",
    "files": [
