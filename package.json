@@ -1,6 +1,6 @@
 {
    "name": "@kylewhirl/scrypted-simplisafe",
-   "version": "0.1.1",
+   "version": "0.1.2",
    "description": "Simplisafe integration for Scrypted",
    "type": "commonjs",
    "main": "out/main.nodejs.js",
