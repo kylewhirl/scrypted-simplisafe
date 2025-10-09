@@ -1,0 +1,11 @@
+.DS_Store
+out/
+node_modules/
+dist/
+.venv
+# Node
+node_modules/
+.DS_Store
+out/
+dist/
+*.log
