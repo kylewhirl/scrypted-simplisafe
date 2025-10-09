@@ -1,5 +1,10 @@
 {
-   "name": "@scrypted/simplisafe",
+   "name": "@kylewhirl/scrypted-simplisafe",
+   "version": "0.1.0",
+   "description": "Simplisafe integration for Scrypted",
+   "type": "commonjs",
+   "main": "out/main.nodejs.js",
+   "files": ["out", "README.md", "LICENSE"],
    "scripts": {
       "scrypted-setup-project": "scrypted-setup-project",
       "prescrypted-setup-project": "scrypted-package-json",

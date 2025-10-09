@@ -1,3 +1,10 @@
+<span align="center">
+
+<a href="https://www.scrypted.app/"><img alt="scrypted" src="https://www.scrypted.app/img/logo.png" width="80px"></a>
+<img alt="SimpliSafe Logo" src="https://raw.githubusercontent.com/homebridge-simplisafe3/homebridge-simplisafe3/master/.github/simplisafe_logo_wplus.png" width="380px" />
+
+</span>
+
 # Scrypted SimpliSafe Cameras
 
 An unofficial [Scrypted](https://github.com/koush/scrypted) plugin that connects SimpliSafe indoor and doorbell cameras to your Scrypted server. The plugin handles OAuth authentication, discovers every camera on your account, and exposes live video, snapshots, and motion events to the rest of your smart home.
