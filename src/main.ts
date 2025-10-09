@@ -43,6 +43,7 @@ const cameraCacheTime = 15000;
 const rateLimitInitialInterval = 60_000;
 const rateLimitMaxInterval = 2 * 60 * 60 * 1000;
 const mediaHostTtl = 5 * 60 * 1000;
+const RESOLUTION_INTERFACE: ScryptedInterface | string = (ScryptedInterface as any).Resolution ?? 'Resolution';
 
 const ssOAuth: AxiosInstance = axios.create({
     baseURL: 'https://auth.simplisafe.com/oauth',
@@ -555,12 +556,14 @@ class SimplisafeApi {
 }
 
 class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Settings {
+    private static instanceRegistry = new Map<string, string>();
     private readonly nativeCameraId: string;
     private readonly api: SimplisafeApi;
     private readonly authManager: SimplisafeAuthManager;
     private readonly getDebug: DebugProvider;
     private readonly detailsCallback: (details: SimplisafeCameraDetails) => void;
     private readonly statusCallback: (ready: boolean, desiredOnline: boolean) => void;
+    private readonly instanceId: string;
     private details?: SimplisafeCameraDetails;
     private streamOptions?: ResponseMediaStreamOptions[];
     private pictureOptions?: ResponsePictureOptions[];
@@ -587,13 +590,32 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
         this.simplisafeUuid = simplisafeUuid;
         this.detailsCallback = detailsCallback;
         this.statusCallback = statusCallback;
+        this.instanceId = Math.random().toString(36).slice(2);
+
+        const existing = SimplisafeCamera.instanceRegistry.get(nativeId);
+        if (existing && existing !== this.instanceId) {
+            throw new Error(`Duplicate SimplisafeCamera instance for ${nativeId}. existing=${existing} new=${this.instanceId}`);
+        }
+        SimplisafeCamera.instanceRegistry.set(nativeId, this.instanceId);
+        this.console.log('Camera instance created', this.nativeCameraId, this.instanceId);
     }
 
     private notifyStatus(): void {
         this.statusCallback(this.ready, this.desiredOnline);
     }
 
+    private logInstanceUsage(context: string): void {
+        this.console.log('Camera instance used', this.nativeCameraId, this.instanceId, context);
+    }
+
+    dispose(): void {
+        const current = SimplisafeCamera.instanceRegistry.get(this.nativeCameraId);
+        if (current === this.instanceId) {
+            SimplisafeCamera.instanceRegistry.delete(this.nativeCameraId);
+        }
+    }
     updateDetails(details: SimplisafeCameraDetails): void {
+        this.logInstanceUsage('updateDetails');
         this.details = details;
         this.streamOptions = undefined;
         this.pictureOptions = undefined;
@@ -646,6 +668,7 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     }
 
     markReady(): void {
+        this.logInstanceUsage('markReady');
         if (!this.ready) {
             this.ready = true;
             if (this.getDebug()) {
@@ -660,6 +683,7 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     }
 
     async prepareForStreaming(): Promise<boolean> {
+        this.logInstanceUsage('prepareForStreaming');
         try {
             await this.api.getAccessToken();
             await this.getVideoStreamOptions();
@@ -691,6 +715,7 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     }
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
+        this.logInstanceUsage('getVideoStreamOptions');
         console.log('SS:getVideoStreamOptions', this.nativeCameraId);
         try {
             const details = await this.ensureDetails();
@@ -707,6 +732,7 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     }
 
     async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
+        this.logInstanceUsage('getVideoStream');
         console.log('SS:getVideoStream', this.nativeCameraId, options);
         try {
             const details = await this.ensureDetails();
@@ -750,6 +776,7 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     }
 
     async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
+        this.logInstanceUsage('takePicture');
         try {
             const details = await this.ensureDetails();
 
@@ -783,6 +810,7 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     }
 
     async getPictureOptions(): Promise<ResponsePictureOptions[]> {
+        this.logInstanceUsage('getPictureOptions');
         await this.ensureDetails();
 
         if (!this.pictureOptions) {
@@ -898,10 +926,12 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     }
 
     async getSettings(): Promise<Setting[]> {
+        this.logInstanceUsage('getSettings');
         return [];
     }
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
+        this.logInstanceUsage(`putSetting:${key}`);
         if (this.getDebug()) {
             this.console.log(`Ignoring setting ${key} update for SimpliSafe camera ${this.nativeCameraId}.`);
         }
@@ -919,6 +949,8 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
     private readonly cameraReady = new Map<string, boolean>();
     private readonly cameraDesiredOnline = new Map<string, boolean>();
     private readonly cameraLastOnline = new Map<string, boolean>();
+    private readonly lastPublished = new Map<string, string>();
+    private readonly publishTimers = new Map<string, NodeJS.Timeout>();
     private syncing = false;
     private hasDumpedSystemState = false;
     private readonly authManager: SimplisafeAuthManager;
@@ -943,6 +975,95 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         this.initializing = this.initialize();
     }
 
+    private normalizeNativeId(id: string): string {
+        return (id ?? '').trim().toLowerCase();
+    }
+
+    private scheduleRefreshDescriptor(nativeId: string, delayMs = 500): void {
+        const normalized = this.normalizeNativeId(nativeId);
+        const existingTimer = this.publishTimers.get(normalized);
+        if (existingTimer) {
+            clearTimeout(existingTimer);
+        }
+
+        const timer = setTimeout(() => {
+            this.publishTimers.delete(normalized);
+            this.refreshDeviceDescriptor(normalized).catch(err => {
+                this.console.warn(`Failed to refresh descriptor for ${normalized}.`, err);
+            });
+        }, delayMs);
+
+        this.publishTimers.set(normalized, timer);
+    }
+
+    private async publishCameraMeta(nativeId: string, meta: {
+        name: string;
+        type: ScryptedDeviceType;
+        interfaces: (ScryptedInterface | string)[];
+        info?: Device['info'];
+    }): Promise<void> {
+        const normalized = this.normalizeNativeId(nativeId);
+        const interfaces = [...new Set(meta.interfaces.filter(Boolean))];
+        const descriptor: Device = {
+            nativeId: normalized,
+            name: meta.name,
+            type: meta.type,
+            interfaces,
+        };
+        if (meta.info) {
+            descriptor.info = meta.info;
+        }
+        const key = JSON.stringify({
+            name: descriptor.name,
+            type: descriptor.type,
+            interfaces: descriptor.interfaces,
+        });
+        if (this.lastPublished.get(normalized) === key) {
+            return;
+        }
+        try {
+            await deviceManager.onDevicesChanged({ devices: [descriptor] });
+            this.lastPublished.set(normalized, key);
+        } catch (err) {
+            this.console.warn(`Failed to publish SimpliSafe device descriptor for ${normalized}.`, err);
+        }
+    }
+
+    private async refreshDeviceDescriptor(nativeId: string): Promise<void> {
+        const details = this.cameraDetails.get(nativeId);
+        if (!details) {
+            return;
+        }
+
+        const includeVideoCamera = this.upgradedNativeIds.has(nativeId);
+        const interfaces: (ScryptedInterface | string)[] = [
+            ScryptedInterface.Camera,
+            ScryptedInterface.Settings,
+            RESOLUTION_INTERFACE,
+            ScryptedInterface.Online,
+        ];
+
+        if (includeVideoCamera) {
+            interfaces.push(ScryptedInterface.VideoCamera);
+        }
+
+        const name = details.cameraSettings?.cameraName
+            || details.name
+            || `Camera ${details.uuid ?? nativeId}`;
+
+        await this.publishCameraMeta(nativeId, {
+            name,
+            type: ScryptedDeviceType.Camera,
+            interfaces,
+            info: {
+                manufacturer: 'SimpliSafe',
+                model: details.model,
+                serialNumber: details.uuid,
+                firmware: details.cameraSettings?.admin?.firmwareVersion,
+            },
+        });
+    }
+
     private async maintenanceCleanup(): Promise<void> {
         if (process.env.SIMPLISAFE_DEV_CLEAN !== '1') {
             return;
@@ -957,11 +1078,15 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 }
                 let name: string | undefined;
                 let id: string | undefined;
+                let hasDeviceState = false;
                 try {
                     const state = deviceManager.getDeviceState(nativeId);
                     if (state && (state as any)._id) {
                         id = (state as any)._id;
                         name = (state as any).name;
+                    }
+                    if (state) {
+                        hasDeviceState = true;
                     }
                 } catch (err) {
                     this.console.warn(`SimpliSafe maintenance: failed to retrieve state for nativeId ${nativeId}.`, err);
@@ -973,7 +1098,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                     continue;
                 }
 
-                if (this.currentNativeIds.has(nativeId)) {
+                if (this.currentNativeIds.has(this.normalizeNativeId(nativeId))) {
                     continue;
                 }
 
@@ -989,7 +1114,10 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 }
 
                 try {
-                    await deviceManager.onDeviceRemoved(nativeId);
+                    const existingState = hasDeviceState ? true : !!deviceManager.getDeviceState(nativeId);
+                    if (existingState) {
+                        await deviceManager.onDeviceRemoved(nativeId);
+                    }
                 } catch (err) {
                     this.console.warn(`SimpliSafe maintenance: failed to remove stale device ${nativeId}.`, err);
                 }
@@ -1021,108 +1149,67 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         }
     }
 
-    private updateCameraDetails(nativeId: string, details: SimplisafeCameraDetails): void {
-        const previousUuid = this.nativeIdToUuid.get(nativeId);
+    private handleCameraDetailsUpdate(nativeId: string, details: SimplisafeCameraDetails): void {
+        const normalized = this.normalizeNativeId(nativeId);
+        const previousUuid = this.nativeIdToUuid.get(normalized);
         if (previousUuid && previousUuid !== details.uuid) {
             this.uuidToNativeId.delete(previousUuid);
         }
 
-        this.cameraDetails.set(nativeId, details);
+        this.cameraDetails.set(normalized, details);
 
         if (details.uuid) {
-            this.nativeIdToUuid.set(nativeId, details.uuid);
-            this.uuidToNativeId.set(details.uuid, nativeId);
+            this.nativeIdToUuid.set(normalized, details.uuid);
+            this.uuidToNativeId.set(details.uuid, normalized);
         } else {
-            this.nativeIdToUuid.delete(nativeId);
+            this.nativeIdToUuid.delete(normalized);
         }
 
         const desiredOnline = details.status ? details.status === 'online' : true;
-        this.cameraDesiredOnline.set(nativeId, desiredOnline);
+        this.cameraDesiredOnline.set(normalized, desiredOnline);
 
-        if (!this.cameraReady.has(nativeId)) {
-            this.cameraReady.set(nativeId, false);
+        if (!this.cameraReady.has(normalized)) {
+            this.cameraReady.set(normalized, false);
         }
 
         if (!this.syncing) {
-            void this.publishDescriptor(nativeId);
+            this.scheduleRefreshDescriptor(normalized);
         }
     }
 
     private updateCameraStatus(nativeId: string, ready: boolean, desiredOnline: boolean): void {
-        this.cameraReady.set(nativeId, ready);
-        this.cameraDesiredOnline.set(nativeId, desiredOnline);
+        const normalized = this.normalizeNativeId(nativeId);
+        const previousReady = this.cameraReady.get(normalized);
+        this.cameraReady.set(normalized, ready);
+        this.cameraDesiredOnline.set(normalized, desiredOnline);
 
-        if (!this.syncing) {
-            void this.publishDescriptor(nativeId);
-
-            const online = ready && desiredOnline;
-            const previous = this.cameraLastOnline.get(nativeId);
-            if (previous !== online) {
-                this.cameraLastOnline.set(nativeId, online);
-                deviceManager.onDeviceEvent(nativeId, ScryptedInterface.Online, online).catch(err => {
-                    this.console.warn(`Failed to report online status for ${nativeId}.`, err);
-                });
-            }
-        }
-    }
-
-    private createDescriptor(nativeId: string): Device | undefined {
-        const details = this.cameraDetails.get(nativeId);
-        if (!details) {
-            return undefined;
+        if (!this.syncing && previousReady !== ready && !this.upgradedNativeIds.has(normalized)) {
+            this.scheduleRefreshDescriptor(normalized);
         }
 
-        const ready = this.cameraReady.get(nativeId) ?? false;
-        const interfaces: (ScryptedInterface | string)[] = [
-            ScryptedInterface.Camera,
-            ScryptedInterface.Settings,
-            'Resolution',
-            ScryptedInterface.Online,
-        ];
-
-        if (ready) {
-            interfaces.push(ScryptedInterface.VideoCamera);
-        }
-
-        return {
-            nativeId,
-            name: details.cameraSettings?.cameraName || details.name || `Camera ${details.uuid ?? nativeId}`,
-            type: ScryptedDeviceType.Camera,
-            interfaces,
-            info: {
-                manufacturer: 'SimpliSafe',
-                model: details.model,
-                serialNumber: details.uuid,
-                firmware: details.cameraSettings?.admin?.firmwareVersion,
-            },
-        };
-    }
-
-    private async publishDescriptor(nativeId: string): Promise<void> {
-        const descriptor = this.createDescriptor(nativeId);
-        if (!descriptor) {
-            return;
-        }
-
-        try {
-            await deviceManager.onDevicesChanged({ devices: [descriptor] });
-        } catch (err) {
-            this.console.warn(`Failed to publish SimpliSafe device descriptor for ${nativeId}.`, err);
+        const online = ready && desiredOnline;
+        const previous = this.cameraLastOnline.get(normalized);
+        if (previous !== online) {
+            this.cameraLastOnline.set(normalized, online);
+            deviceManager.onDeviceEvent(normalized, ScryptedInterface.Online, online).catch(err => {
+                this.console.warn(`Failed to report online status for ${normalized}.`, err);
+            });
         }
     }
 
     private scheduleReadinessEvaluation(nativeId: string, delayMs = 0): void {
-        if (this.upgradedNativeIds.has(nativeId)) {
+        const normalized = this.normalizeNativeId(nativeId);
+        if (this.upgradedNativeIds.has(normalized)) {
             return;
         }
-        if (this.readinessTasks.has(nativeId)) {
+        if (this.readinessTasks.has(normalized)) {
             return;
         }
 
-        const task = this.runReadinessEvaluation(nativeId, delayMs).finally(() => {
-            this.readinessTasks.delete(nativeId);
+        const task = this.runReadinessEvaluation(normalized, delayMs).finally(() => {
+            this.readinessTasks.delete(normalized);
         });
-        this.readinessTasks.set(nativeId, task);
+        this.readinessTasks.set(normalized, task);
     }
 
     private async runReadinessEvaluation(nativeId: string, delayMs: number): Promise<void> {
@@ -1152,18 +1239,20 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
     }
 
     private async publishCameraUpgrade(nativeId: string, device: SimplisafeCamera): Promise<void> {
-        if (this.upgradedNativeIds.has(nativeId)) {
+        const normalized = this.normalizeNativeId(nativeId);
+        if (this.upgradedNativeIds.has(normalized)) {
             return;
         }
-        const details = this.cameraDetails.get(nativeId);
+        const details = this.cameraDetails.get(normalized);
         if (!details) {
-            this.console.warn(`SimpliSafe readiness: missing details for ${nativeId}, skipping upgrade.`);
+            this.console.warn(`SimpliSafe readiness: missing details for ${normalized}, skipping upgrade.`);
             return;
         }
 
-        this.upgradedNativeIds.add(nativeId);
+        this.upgradedNativeIds.add(normalized);
         device.markReady();
-        console.log('SS: camera now ready, advertising VideoCamera:', nativeId);
+        await this.refreshDeviceDescriptor(normalized);
+        console.log('SS: camera now ready, advertising VideoCamera:', normalized);
     }
 
     private async initialize(): Promise<void> {
@@ -1193,7 +1282,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 if (!camera) {
                     continue;
                 }
-                const nativeId = deriveCameraNativeId(camera);
+                const nativeId = this.normalizeNativeId(deriveCameraNativeId(camera));
                 if (this.cameraDetails.has(nativeId) && this.debug) {
                     this.console.warn(`Duplicate cached SimpliSafe camera nativeId detected: ${nativeId}. Overwriting existing entry.`);
                 }
@@ -1209,21 +1298,21 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
     }
 
     async getDevice(nativeId: string): Promise<SimplisafeCamera> {
-        let device = this.devices.get(nativeId);
-        if (device) {
-            if (this.debug) {
-                this.console.log(`getDevice returning cached device for ${nativeId}.`);
-            }
-            return device;
+        const normalized = this.normalizeNativeId(nativeId);
+        const existing = this.devices.get(normalized);
+        if (existing) {
+            this.console.log(`getDevice returning cached device for ${normalized}`);
+            return existing;
         }
 
-        let lookupNativeId = nativeId;
+        let lookupNativeId = normalized;
 
-        if (!this.cameraDetails.has(nativeId)) {
+        if (!this.cameraDetails.has(lookupNativeId)) {
             const migratedNativeId = this.uuidToNativeId.get(nativeId);
-            if (migratedNativeId && migratedNativeId !== nativeId) {
-                this.console.warn(`Legacy SimpliSafe nativeId ${nativeId} requested. Redirecting to stable nativeId ${migratedNativeId}.`);
-                lookupNativeId = migratedNativeId;
+            if (migratedNativeId && this.normalizeNativeId(migratedNativeId) !== lookupNativeId) {
+                const stable = this.normalizeNativeId(migratedNativeId);
+                this.console.warn(`Legacy SimpliSafe nativeId ${nativeId} requested. Redirecting to stable nativeId ${stable}.`);
+                lookupNativeId = stable;
             }
         }
 
@@ -1261,32 +1350,38 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
             this.uuidToNativeId.set(simplisafeUuid, lookupNativeId);
         }
 
-        device = new SimplisafeCamera(
+        const device = new SimplisafeCamera(
             lookupNativeId,
             simplisafeUuid,
             this.api,
             this.authManager,
             () => this.debug,
-            updated => this.updateCameraDetails(lookupNativeId, updated),
+            updated => this.handleCameraDetailsUpdate(lookupNativeId, updated),
             (ready, desiredOnline) => this.updateCameraStatus(lookupNativeId, ready, desiredOnline),
         );
         if (!this.cameraReady.has(lookupNativeId)) {
             this.cameraReady.set(lookupNativeId, false);
         }
-        device.updateDetails(details);
         this.devices.set(lookupNativeId, device);
-        if (lookupNativeId !== nativeId) {
-            this.devices.set(nativeId, device);
-        }
-        if (this.debug) {
-            const displayName = details?.cameraSettings?.cameraName || details?.name || lookupNativeId;
-            this.console.log(`Created new SimplisafeCamera device for ${lookupNativeId}. Name=${displayName}`);
-        }
+        device.updateDetails(details);
+        this.console.log(`Created new SimplisafeCamera device for ${lookupNativeId}`);
         return device;
     }
 
     async releaseDevice(id: string, nativeId: string): Promise<void> {
-        this.devices.delete(nativeId);
+        const normalized = this.normalizeNativeId(nativeId);
+        const device = this.devices.get(normalized);
+        if (device) {
+            device.dispose();
+        }
+        this.devices.delete(normalized);
+        const timer = this.publishTimers.get(normalized);
+        if (timer) {
+            clearTimeout(timer);
+            this.publishTimers.delete(normalized);
+        }
+        this.lastPublished.delete(normalized);
+        this.readinessTasks.delete(normalized);
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -1412,40 +1507,28 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
 
             this.currentNativeIds.clear();
             const existing = new Set(this.cameraDetails.keys());
-            const descriptors: Device[] = [];
 
             for (const camera of cameras) {
-                const nativeId = deriveCameraNativeId(camera);
+                const derivedNativeId = deriveCameraNativeId(camera);
+                const nativeId = this.normalizeNativeId(derivedNativeId);
                 existing.delete(nativeId);
                 this.currentNativeIds.add(nativeId);
-                this.updateCameraDetails(nativeId, camera);
+                this.handleCameraDetailsUpdate(nativeId, camera);
                 if (!this.cameraReady.has(nativeId)) {
                     this.cameraReady.set(nativeId, false);
                 }
-
-                const descriptor = this.createDescriptor(nativeId);
-                if (descriptor) {
-                    descriptors.push(descriptor);
-                }
+                this.scheduleRefreshDescriptor(nativeId, 0);
             }
 
             this.storage.setItem('cameras', JSON.stringify(cameras));
-            const registeredIds = descriptors.map(device => {
-                const nativeId = device.nativeId;
-                if (!nativeId) {
-                    return '(missing-nativeId)';
-                }
+            const registeredIds = cameras.map(camera => {
+                const nativeId = this.normalizeNativeId(deriveCameraNativeId(camera));
                 const uuid = this.nativeIdToUuid.get(nativeId);
                 return uuid ? `${nativeId} (uuid: ${uuid})` : nativeId;
             });
             this.console.log(`SimpliSafe onDevicesChanged registering: ${registeredIds.length ? registeredIds.join(', ') : 'none'}.`);
 
-            await deviceManager.onDevicesChanged({ devices: descriptors });
             this.dumpSystemStateOnce();
-            if (this.debug) {
-                const publishedIds = descriptors.map(d => d.nativeId).join(', ') || 'none';
-                this.console.log(`syncDevices published ${descriptors.length} cameras to Scrypted: ${publishedIds}`);
-            }
 
             for (const [id, device] of this.devices) {
                 const details = this.cameraDetails.get(id);
@@ -1478,9 +1561,23 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 this.cameraDesiredOnline.delete(legacy);
                 this.cameraLastOnline.delete(legacy);
                 this.upgradedNativeIds.delete(legacy);
+                this.readinessTasks.delete(legacy);
+                const timer = this.publishTimers.get(legacy);
+                if (timer) {
+                    clearTimeout(timer);
+                    this.publishTimers.delete(legacy);
+                }
+                this.lastPublished.delete(legacy);
+                const device = this.devices.get(legacy);
+                if (device) {
+                    device.dispose();
+                }
                 this.devices.delete(legacy);
                 try {
-                    await deviceManager.onDeviceRemoved(legacy);
+                    const state = deviceManager.getDeviceState(legacy);
+                    if (state) {
+                        await deviceManager.onDeviceRemoved(legacy);
+                    }
                 } catch (err) {
                     this.console.warn(`Failed to remove legacy SimpliSafe nativeId ${legacy}.`, err);
                 }
