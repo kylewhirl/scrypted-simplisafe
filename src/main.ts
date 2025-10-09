@@ -55,12 +55,12 @@ const ssOAuth: AxiosInstance = axios.create({
 });
 axiosRetry(ssOAuth, { retries: 3 });
 
-export const AUTH_EVENTS = {
+const AUTH_EVENTS = {
     REFRESH_CREDENTIALS_SUCCESS: 'REFRESH_CREDENTIALS_SUCCESS',
     REFRESH_CREDENTIALS_FAILURE: 'REFRESH_CREDENTIALS_FAILURE',
 } as const;
 
-export const EVENT_TYPES = {
+const EVENT_TYPES = {
     CAMERA_MOTION: 'CAMERA_MOTION',
     DOORBELL: 'DOORBELL',
 } as const;
@@ -110,7 +110,7 @@ interface SimplisafeRealtimeInternalDetails {
     [key: string]: unknown;
 }
 
-export interface SimplisafeRealtimeEvent {
+interface SimplisafeRealtimeEvent {
     sid?: string;
     eventCid?: number;
     sensorSerial?: string;
