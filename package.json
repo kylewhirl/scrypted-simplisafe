@@ -12,7 +12,9 @@
       "scrypted-deploy": "scrypted-deploy",
       "scrypted-readme": "scrypted-readme",
       "scrypted-package-json": "scrypted-package-json",
-      "dev:logs": "SIMPLISAFE_DEV_CLEAN=1 npm run scrypted-vscode-launch -- 127.0.0.1"
+      "dev:logs": "SIMPLISAFE_DEV_CLEAN=1 npm run scrypted-vscode-launch -- 127.0.0.1",
+      "guard:save": "git add -A && git commit -m \"GUARD: savepoint\" && git tag -f codex-savepoint && echo 'Savepoint set: codex-savepoint'",
+      "guard:revert": "git reset --hard codex-savepoint && echo 'Reverted to codex-savepoint'"
    },
    "scrypted": {
       "rollup": true,
