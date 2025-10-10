@@ -22,6 +22,11 @@ An unofficial [Scrypted](https://github.com/koush/scrypted) plugin that connects
 - Node.js 18+ if you plan to build or develop the plugin locally.
 
 ## Installation
+
+### Via Scrypted UI
+- Search for `@kylewhirl` and you'll see the scrypted-simplisafe plugin
+
+### Via terminal
 1. **Install dependencies**
    ```bash
    npm install
