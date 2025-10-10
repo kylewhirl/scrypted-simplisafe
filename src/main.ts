@@ -22,7 +22,8 @@ import axios, { AxiosError, AxiosInstance, AxiosRequestConfig } from 'axios';
 import axiosRetry from 'axios-retry';
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
-import { lookup } from 'dns/promises';
+import dns from 'dns';
+const { lookup } = dns.promises;
 import jpegExtract from 'jpeg-extract';
 import WebSocket, { RawData } from 'ws';
 
