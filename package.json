@@ -1,6 +1,6 @@
 {
    "name": "@kylewhirl/scrypted-simplisafe",
-   "version": "0.1.4",
+   "version": "0.1.5",
    "description": "Simplisafe integration for Scrypted",
    "license": "Apache",
    "repository": {
