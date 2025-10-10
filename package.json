@@ -50,7 +50,7 @@
       ]
    },
    "dependencies": {
-      "@scrypted/sdk": "^0.5.29",
+      "@scrypted/sdk": "^0.5.46",
       "axios": "^1.7.7",
       "axios-retry": "^3.9.1",
       "jpeg-extract": "^3.0.1",
