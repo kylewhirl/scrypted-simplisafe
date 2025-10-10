@@ -1,8 +1,8 @@
 {
    "name": "@kylewhirl/scrypted-simplisafe",
-   "version": "0.1.5",
+   "version": "0.1.3",
    "description": "Simplisafe integration for Scrypted",
-   "license": "MIT",
+   "license": "Apache",
    "repository": {
       "type": "git",
       "url": "git+https://github.com/kylewhirl/scrypted-simplisafe.git"
@@ -18,9 +18,9 @@
       "camera"
    ],
    "type": "commonjs",
-   "main": "dist/main.nodejs.js",
+   "main": "out/main.nodejs.js",
    "files": [
-      "dist",
+      "out",
       "README.md",
       "LICENSE"
    ],

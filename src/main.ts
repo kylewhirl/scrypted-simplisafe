@@ -1,3 +1,10 @@
+/**
+ * Portions of this file are adapted from homebridge-simplisafe3
+ * (https://github.com/homebridge-simplisafe3)
+ * Copyright (c) 2020–2025 homebridge-simplisafe3 contributors
+ * Licensed under the MIT License.
+ */
+
 import sdk, {
     Camera,
     Device,
