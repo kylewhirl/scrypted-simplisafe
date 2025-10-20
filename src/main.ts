@@ -149,6 +149,7 @@ function normalizeIdSegment(value: string): string {
 
 function deriveCameraNativeId(camera: SimplisafeCameraDetails): string {
     const candidates: (string | undefined)[] = [
+        camera.uuid,
         (camera as any)?.serialNumber,
         (camera as any)?.serial,
         (camera as any)?.deviceSerial,
@@ -156,7 +157,6 @@ function deriveCameraNativeId(camera: SimplisafeCameraDetails): string {
         (camera as any)?.mac,
         camera.cameraSettings?.cameraName,
         camera.name,
-        camera.uuid,
     ].map(candidate => (typeof candidate === 'string' ? candidate.trim() : undefined));
 
     const firstValid = candidates.find(candidate => candidate);
