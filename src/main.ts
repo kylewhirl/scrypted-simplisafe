@@ -113,6 +113,14 @@ interface SimplisafeCameraDetails {
 
 type DebugProvider = () => boolean;
 
+interface CachedCameraDescriptor {
+    nativeId: string;
+    name: string;
+    type: ScryptedDeviceType;
+    interfaces: (ScryptedInterface | string)[];
+    info?: Device['info'];
+}
+
 interface SimplisafeRealtimeInternalDetails {
     mainCamera?: string;
     [key: string]: unknown;
@@ -1318,6 +1326,8 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
     private readonly cameraLastOnline = new Map<string, boolean>();
     private readonly lastPublished = new Map<string, string>();
     private readonly publishTimers = new Map<string, NodeJS.Timeout>();
+    private readonly cachedDescriptors = new Map<string, CachedCameraDescriptor>();
+    private readonly pendingRemoval = new Map<string, number>();
     private syncing = false;
     private hasDumpedSystemState = false;
     private readonly authManager: SimplisafeAuthManager;
@@ -1325,6 +1335,8 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
     private debug: boolean;
     private accountNumber?: string;
     private initializing?: Promise<void>;
+    private persistCameraDetailsTimer?: NodeJS.Timeout;
+    private pendingRemovalTimer?: NodeJS.Timeout;
 
     constructor() {
         super();
@@ -1340,6 +1352,10 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
 
         this.loadCachedCameras();
         this.loadCameraReadiness();
+        this.loadCachedDescriptors();
+        this.republishCachedDescriptors().catch(err => {
+            this.console.warn('Failed to republish cached SimpliSafe descriptors during startup.', err);
+        });
         this.maintenanceCleanup();
         this.initializing = this.initialize();
     }
@@ -1476,17 +1492,26 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         if (meta.info) {
             descriptor.info = meta.info;
         }
-        const key = JSON.stringify({
+        const cachedDescriptor: CachedCameraDescriptor = {
+            nativeId: normalized,
             name: descriptor.name,
-            type: descriptor.type,
+            type: meta.type,
             interfaces: descriptor.interfaces,
-        });
+            info: descriptor.info,
+        };
+        const key = this.computeDescriptorKey(cachedDescriptor);
         if (this.lastPublished.get(normalized) === key) {
+            if (!this.cachedDescriptors.has(normalized)) {
+                this.cachedDescriptors.set(normalized, cachedDescriptor);
+                this.persistCachedDescriptors();
+            }
             return;
         }
         try {
             await deviceManager.onDevicesChanged({ devices: [descriptor] });
             this.lastPublished.set(normalized, key);
+            this.cachedDescriptors.set(normalized, cachedDescriptor);
+            this.persistCachedDescriptors();
         } catch (err) {
             this.console.warn(`Failed to publish SimpliSafe device descriptor for ${normalized}.`, err);
         }
@@ -1621,6 +1646,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         }
 
         this.cameraDetails.set(normalized, details);
+        this.pendingRemoval.delete(normalized);
 
         if (details.uuid) {
             this.nativeIdToUuid.set(normalized, details.uuid);
@@ -1639,6 +1665,8 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         if (!this.syncing) {
             this.scheduleRefreshDescriptor(normalized);
         }
+
+        this.schedulePersistCameraDetails();
     }
 
     private updateCameraStatus(nativeId: string, ready: boolean, desiredOnline: boolean): void {
@@ -1802,6 +1830,115 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         }
     }
 
+    private loadCachedDescriptors(): void {
+        const cached = this.storage.getItem('cameraDescriptors');
+        if (!cached) {
+            return;
+        }
+
+        try {
+            const parsed = JSON.parse(cached) as CachedCameraDescriptor[];
+            if (!Array.isArray(parsed)) {
+                return;
+            }
+
+            for (const descriptor of parsed) {
+                if (!descriptor?.nativeId || !descriptor?.name || !descriptor?.type || !Array.isArray(descriptor.interfaces)) {
+                    continue;
+                }
+                const normalized = this.normalizeNativeId(descriptor.nativeId);
+                const stored: CachedCameraDescriptor = {
+                    nativeId: normalized,
+                    name: descriptor.name,
+                    type: descriptor.type,
+                    interfaces: [...new Set(descriptor.interfaces.filter(Boolean))],
+                    info: descriptor.info,
+                };
+                this.cachedDescriptors.set(normalized, stored);
+                const key = this.computeDescriptorKey(stored);
+                this.lastPublished.set(normalized, key);
+                if (stored.interfaces.includes(ScryptedInterface.VideoCamera) || stored.interfaces.includes('VideoCamera')) {
+                    this.upgradedNativeIds.add(normalized);
+                    if (!this.cameraReady.has(normalized)) {
+                        this.cameraReady.set(normalized, true);
+                    }
+                }
+            }
+        } catch (err) {
+            this.console.warn('Failed to load cached SimpliSafe device descriptors.', err);
+        }
+    }
+
+    private async republishCachedDescriptors(): Promise<void> {
+        if (this.cachedDescriptors.size === 0) {
+            return;
+        }
+
+        const devices: Device[] = [];
+        for (const descriptor of this.cachedDescriptors.values()) {
+            devices.push({
+                nativeId: descriptor.nativeId,
+                name: descriptor.name,
+                type: descriptor.type,
+                interfaces: descriptor.interfaces,
+                info: descriptor.info,
+            });
+        }
+
+        try {
+            await deviceManager.onDevicesChanged({ devices });
+        } catch (err) {
+            this.console.warn('Failed to republish cached SimpliSafe devices.', err);
+        }
+    }
+
+    private persistCachedDescriptors(): void {
+        try {
+            if (this.cachedDescriptors.size === 0) {
+                this.storage.removeItem('cameraDescriptors');
+                return;
+            }
+            const payload = Array.from(this.cachedDescriptors.values());
+            this.storage.setItem('cameraDescriptors', JSON.stringify(payload));
+        } catch (err) {
+            this.console.warn('Failed to persist cached SimpliSafe descriptors.', err);
+        }
+    }
+
+    private computeDescriptorKey(descriptor: CachedCameraDescriptor): string {
+        const sortedInterfaces = [...descriptor.interfaces].sort();
+        return JSON.stringify({
+            name: descriptor.name,
+            type: descriptor.type,
+            interfaces: sortedInterfaces,
+            info: descriptor.info ?? null,
+        });
+    }
+
+    private persistCameraDetails(): void {
+        try {
+            if (this.cameraDetails.size === 0) {
+                this.storage.removeItem('cameras');
+                return;
+            }
+            const details = Array.from(this.cameraDetails.values());
+            this.storage.setItem('cameras', JSON.stringify(details));
+        } catch (err) {
+            this.console.warn('Failed to persist SimpliSafe camera details.', err);
+        }
+    }
+
+    private schedulePersistCameraDetails(): void {
+        if (this.persistCameraDetailsTimer) {
+            return;
+        }
+
+        this.persistCameraDetailsTimer = setTimeout(() => {
+            this.persistCameraDetailsTimer = undefined;
+            this.persistCameraDetails();
+        }, 500);
+    }
+
     async getDevice(nativeId: string): Promise<SimplisafeCamera> {
         const normalized = this.normalizeNativeId(nativeId);
         const existing = this.devices.get(normalized);
@@ -1890,6 +2027,10 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         }
         this.lastPublished.delete(normalized);
         this.readinessTasks.delete(normalized);
+        this.cachedDescriptors.delete(normalized);
+        this.persistCachedDescriptors();
+        this.pendingRemoval.delete(normalized);
+        this.schedulePersistCameraDetails();
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -2060,7 +2201,27 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 }
             }
 
+            const now = Date.now();
             for (const legacy of existing) {
+                const missingSince = this.pendingRemoval.get(legacy);
+                if (!forceRefresh) {
+                    if (!missingSince) {
+                        this.pendingRemoval.set(legacy, now);
+                        if (this.debug) {
+                            this.console.log(`SimpliSafe camera ${legacy} missing from discovery; awaiting confirmation before removal.`);
+                        }
+                    }
+                    this.scheduleRemovalRecheck();
+                    continue;
+                }
+
+                if (!missingSince) {
+                    this.pendingRemoval.set(legacy, now);
+                    this.scheduleRemovalRecheck();
+                    continue;
+                }
+
+                this.pendingRemoval.delete(legacy);
                 const uuid = this.nativeIdToUuid.get(legacy);
                 if (uuid) {
                     this.removeUuidAssociation(uuid);
@@ -2085,6 +2246,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                     device.dispose();
                 }
                 this.devices.delete(legacy);
+                this.cachedDescriptors.delete(legacy);
                 try {
                     const state = deviceManager.getDeviceState(legacy);
                     if (state) {
@@ -2093,6 +2255,8 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 } catch (err) {
                     this.console.warn(`Failed to remove legacy SimpliSafe nativeId ${legacy}.`, err);
                 }
+                this.persistCachedDescriptors();
+                this.schedulePersistCameraDetails();
             }
 
             for (const nativeId of this.cameraDetails.keys()) {
@@ -2110,6 +2274,19 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         } finally {
             this.syncing = false;
         }
+    }
+
+    private scheduleRemovalRecheck(delayMs = 60_000): void {
+        if (this.pendingRemovalTimer) {
+            return;
+        }
+
+        this.pendingRemovalTimer = setTimeout(() => {
+            this.pendingRemovalTimer = undefined;
+            this.syncDevices(true).catch(err => {
+                this.console.warn('SimpliSafe removal confirmation sync failed.', err);
+            });
+        }, delayMs);
     }
 }
 
