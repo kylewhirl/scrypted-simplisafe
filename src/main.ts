@@ -1312,6 +1312,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
     private readonly currentNativeIds = new Set<string>();
     private readonly readinessTasks = new Map<string, Promise<void>>();
     private readonly upgradedNativeIds = new Set<string>();
+    private readonly readinessStorageKey = 'cameraReadiness';
     private readonly cameraReady = new Map<string, boolean>();
     private readonly cameraDesiredOnline = new Map<string, boolean>();
     private readonly cameraLastOnline = new Map<string, boolean>();
@@ -1338,6 +1339,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         this.api.on(EVENT_TYPES.CAMERA_MOTION, event => this.handleCameraMotionEvent(event));
 
         this.loadCachedCameras();
+        this.loadCameraReadiness();
         this.maintenanceCleanup();
         this.initializing = this.initialize();
     }
@@ -1712,6 +1714,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         }
 
         this.upgradedNativeIds.add(normalized);
+        this.persistCameraReadiness();
         device.markReady();
         await this.refreshDeviceDescriptor(normalized);
         console.log('SS: camera now ready, advertising VideoCamera:', normalized);
@@ -1757,6 +1760,45 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
             }
         } catch (err) {
             this.console.warn('Failed to load cached camera data.', err);
+        }
+    }
+
+    private loadCameraReadiness(): void {
+        const stored = this.storage.getItem(this.readinessStorageKey);
+        if (!stored) {
+            return;
+        }
+
+        try {
+            const parsed = JSON.parse(stored) as unknown;
+            const readyIds: string[] = Array.isArray(parsed)
+                ? parsed.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+                : parsed && typeof parsed === 'object'
+                    ? Object.entries(parsed as Record<string, unknown>)
+                        .filter(([, value]) => value === true)
+                        .map(([id]) => id)
+                    : [];
+
+            for (const id of readyIds) {
+                const normalized = this.normalizeNativeId(id);
+                this.upgradedNativeIds.add(normalized);
+                this.cameraReady.set(normalized, true);
+            }
+        } catch (err) {
+            this.console.warn('Failed to load SimpliSafe camera readiness state.', err);
+        }
+    }
+
+    private persistCameraReadiness(): void {
+        try {
+            const ready = Array.from(this.upgradedNativeIds);
+            if (ready.length > 0) {
+                this.storage.setItem(this.readinessStorageKey, JSON.stringify(ready));
+            } else {
+                this.storage.removeItem(this.readinessStorageKey);
+            }
+        } catch (err) {
+            this.console.warn('Failed to persist SimpliSafe camera readiness state.', err);
         }
     }
 
@@ -1827,6 +1869,9 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         }
         this.devices.set(lookupNativeId, device);
         device.updateDetails(details);
+        if (this.upgradedNativeIds.has(lookupNativeId)) {
+            device.markReady();
+        }
         this.console.log(`Created new SimplisafeCamera device for ${lookupNativeId}`);
         return device;
     }
@@ -1969,6 +2014,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 this.console.log(`syncDevices received ${cameras.length} cameras from API.`);
             }
 
+            let readinessChanged = false;
             this.currentNativeIds.clear();
             const existing = new Set(this.cameraDetails.keys());
 
@@ -2024,7 +2070,9 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 this.cameraReady.delete(legacy);
                 this.cameraDesiredOnline.delete(legacy);
                 this.cameraLastOnline.delete(legacy);
-                this.upgradedNativeIds.delete(legacy);
+                if (this.upgradedNativeIds.delete(legacy)) {
+                    readinessChanged = true;
+                }
                 this.readinessTasks.delete(legacy);
                 const timer = this.publishTimers.get(legacy);
                 if (timer) {
@@ -2049,6 +2097,10 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
 
             for (const nativeId of this.cameraDetails.keys()) {
                 this.scheduleReadinessEvaluation(nativeId);
+            }
+
+            if (readinessChanged) {
+                this.persistCameraReadiness();
             }
 
             await this.startRealtimeEvents();
