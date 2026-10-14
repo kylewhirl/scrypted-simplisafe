@@ -1,6 +1,6 @@
 {
    "name": "@kylewhirl/scrypted-simplisafe",
-   "version": "0.1.5",
+   "version": "0.1.10",
    "description": "Simplisafe integration for Scrypted",
    "license": "MIT",
    "repository": {
@@ -22,6 +22,7 @@
    "files": [
       "dist",
       "README.md",
+      "CHANGELOG.md",
       "LICENSE"
    ],
    "scripts": {
