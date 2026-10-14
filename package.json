@@ -28,6 +28,8 @@
       "scrypted-setup-project": "scrypted-setup-project",
       "prescrypted-setup-project": "scrypted-package-json",
       "build": "scrypted-webpack",
+      "typecheck": "tsc --noEmit",
+      "test": "node --test tests/*.test.cjs",
       "prepublishOnly": "NODE_ENV=production scrypted-webpack",
       "prescrypted-vscode-launch": "scrypted-webpack",
       "scrypted-vscode-launch": "scrypted-deploy-debug",
@@ -61,6 +63,7 @@
       "@koush/werift": "^0.17.14"
    },
    "devDependencies": {
+      "@types/lodash": "^4.17.26",
       "@types/node": "^24.0.10",
       "@types/ws": "^8.18.1"
    }

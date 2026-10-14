@@ -405,7 +405,9 @@ interface ViewerSinks {
     audio: (rtp: RtpPacket) => void;
 }
 
-async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike, debug: () => boolean, sinks: ViewerSinks): Promise<LiveKitViewer> {
+async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike, debug: () => boolean, sinks: ViewerSinks, signal?: AbortSignal): Promise<LiveKitViewer> {
+    if (signal?.aborted)
+        throw new Error('LiveKit stream closed.');
     const dlog = (...args: any[]) => { if (debug()) console.log(...args); };
     const joinClaims = jwtClaims(details.userToken);
     if (joinClaims)
@@ -571,15 +573,22 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
             clearInterval(gapTimer);
         if (micMuteTimer)
             clearTimeout(micMuteTimer);
-        try { ws.close(); } catch { /* ignore */ }
-        try { pc?.close(); } catch { /* ignore */ }
-        try { publisherPc?.close(); } catch { /* ignore */ }
+        signal?.removeEventListener('abort', cleanup);
+        try { ws.terminate(); } catch { /* ignore */ }
+        // close() is asynchronous in werift; observe its rejection as well as synchronous errors.
+        try { pc?.close().catch(() => { /* ignore */ }); } catch { /* ignore */ }
+        try { publisherPc?.close().catch(() => { /* ignore */ }); } catch { /* ignore */ }
         stopTurnClients(pc);
         stopTurnClients(publisherPc);
         for (const cb of closedCallbacks.splice(0)) {
             try { cb(); } catch { /* ignore */ }
         }
     };
+    signal?.addEventListener('abort', cleanup, { once: true });
+    ws.on('error', err => {
+        dlog('SS:LiveKit websocket error.', err);
+        cleanup();
+    });
 
     const send = (message: SignalRequest['message']) => {
         if (ws.readyState !== WebSocket.OPEN)
@@ -665,12 +674,38 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
     };
 
     await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('LiveKit signaling websocket open timed out.')), 15000);
-        ws.on('open', () => { clearTimeout(timeout); dlog('SS:LiveKit ws open'); resolve(); });
-        ws.on('error', err => { clearTimeout(timeout); reject(err); });
+        let settled = false;
+        const finish = (err?: Error) => {
+            if (settled)
+                return;
+            settled = true;
+            clearTimeout(timeout);
+            ws.off('open', onOpen);
+            ws.off('close', onClosed);
+            const index = closedCallbacks.indexOf(onClosed);
+            if (index >= 0)
+                closedCallbacks.splice(index, 1);
+            if (err) {
+                cleanup();
+                reject(err);
+            } else {
+                dlog('SS:LiveKit ws open');
+                resolve();
+            }
+        };
+        const onOpen = () => finish();
+        const onClosed = () => finish(new Error('LiveKit signaling websocket closed before opening.'));
+        const timeout = setTimeout(() => finish(new Error('LiveKit signaling websocket open timed out.')), 15000);
+        closedCallbacks.push(onClosed);
+        ws.once('open', onOpen);
+        ws.once('close', onClosed);
+        if (closed)
+            onClosed();
     });
 
     const handleSignal = async (data: WebSocket.RawData) => {
+        if (closed)
+            return;
         let messageCase: string | undefined;
         try {
             const bytes = data instanceof Buffer ? new Uint8Array(data)
@@ -848,35 +883,48 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
 
     // Wait for the subscriber peer connection to connect and deliver at least a video track.
     await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('LiveKit subscriber connection timed out.')), 30000);
         let settled = false;
+        const subscriptions: (() => void)[] = [];
         const finish = (err?: Error) => {
             if (settled)
                 return;
             settled = true;
             clearTimeout(timeout);
-            err ? reject(err) : resolve();
+            clearInterval(poll);
+            for (const dispose of subscriptions)
+                dispose();
+            const index = closedCallbacks.indexOf(onClosed);
+            if (index >= 0)
+                closedCallbacks.splice(index, 1);
+            if (err) {
+                cleanup();
+                reject(err);
+            } else {
+                resolve();
+            }
         };
+        const onClosed = () => finish(new Error('LiveKit subscriber connection closed.'));
         const check = () => {
             if (pc?.connectionState === 'connected' && videoTrack)
                 finish();
         };
+        const timeout = setTimeout(() => finish(new Error('LiveKit subscriber connection timed out.')), 30000);
         const poll = setInterval(() => {
-            if (settled) {
-                clearInterval(poll);
-                return;
-            }
             if (pc) {
-                pc.connectionStateChange.subscribe(state => {
+                subscriptions.push(pc.connectionStateChange.subscribe(state => {
                     if (state === 'failed' || state === 'closed')
                         finish(new Error(`LiveKit subscriber connection ${state}.`));
                     else
                         check();
-                });
-                pc.onTrack.subscribe(() => check());
+                }).unSubscribe);
+                subscriptions.push(pc.onTrack.subscribe(() => check()).unSubscribe);
                 clearInterval(poll);
+                check();
             }
         }, 100);
+        closedCallbacks.push(onClosed);
+        if (closed)
+            onClosed();
     });
 
     // A single, persistent talk-back (microphone) track is published to LiveKit at most once per
@@ -904,6 +952,8 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         micTrackRef.writeRtp(rtp);
     };
     const ensureMicTrack = (): Promise<MediaStreamTrack> => {
+        if (closed)
+            return Promise.reject(new Error('LiveKit stream closed.'));
         if (micPublish)
             return micPublish;
         micPublish = (async () => {
@@ -929,7 +979,6 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
             }
 
             const track = new MediaStreamTrack({ kind: 'audio', id: `mic-${Date.now()}` });
-            micTrackRef = track;
             const micTransceiver = publisherPc.addTransceiver(track, { direction: 'sendonly' });
             // The 'answer' handler force-enables RED wrapping on this sender once negotiation settles
             // (werift otherwise leaves redRedundantPayloadType=0 and sends raw Opus mislabelled as RED).
@@ -951,16 +1000,30 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
             });
 
             const offer = await publisherPc.createOffer();
+            if (closed)
+                throw new Error('LiveKit stream closed.');
             await publisherPc.setLocalDescription(offer);
+            if (closed)
+                throw new Error('LiveKit stream closed.');
             send({
                 case: 'offer',
                 value: new SessionDescription({ type: 'offer', sdp: offer.sdp }),
             });
             dlog('SS:LiveKit publishing mic track cid=', cid);
+            micTrackRef = track;
             return track;
         })();
         // Allow a retry on failure (e.g. transient publisher negotiation error).
-        micPublish.catch(() => { micPublish = undefined; });
+        micPublish.catch(() => {
+            stopTurnClients(publisherPc);
+            try { publisherPc?.close().catch(() => { /* ignore */ }); } catch { /* ignore */ }
+            publisherPc = undefined;
+            publisherMicSender = undefined;
+            publisherRemoteDescriptionSet = false;
+            pendingPublisherCandidates.length = 0;
+            micTrackRef = undefined;
+            micPublish = undefined;
+        });
         return micPublish;
     };
 
@@ -1012,14 +1075,14 @@ class WeriftSignalingSession implements RTCSignalingSession {
 
         if (type === 'offer') {
             const offer = await this.pc.createOffer();
-            this.pc.setLocalDescription(offer);
+            await this.pc.setLocalDescription(offer);
             return { type: offer.type, sdp: offer.sdp };
         }
 
         if (!sendIceCandidate)
             await this.remoteDescription;
         const answer = await this.pc.createAnswer();
-        this.pc.setLocalDescription(answer);
+        await this.pc.setLocalDescription(answer);
         return { type: answer.type, sdp: answer.sdp };
     }
 
@@ -1101,6 +1164,8 @@ export class LiveKitCameraStream {
     private viewer?: LiveKitViewer;
     private viewerPromise?: Promise<LiveKitViewer>;
     private refcount = 0;
+    private readonly abort = new AbortController();
+    private readonly retiringViewers = new Map<LiveKitViewer, NodeJS.Timeout>();
 
     // Stable consumer-facing relays. Viewers (one per LiveKit session) push their received RTP
     // into these via per-viewer sinks; the rebasers keep sequence numbers/timestamps continuous
@@ -1148,6 +1213,30 @@ export class LiveKitCameraStream {
     async ensureMicTrack(): Promise<MediaStreamTrack> {
         const viewer = await this.ensureViewer();
         return viewer.ensureMicTrack();
+    }
+
+    getMicTrack(): MediaStreamTrack | undefined {
+        return this.viewer?.getMicTrack();
+    }
+
+    /** Permanently dispose this camera, including attempts still fetching or joining. */
+    close(): void {
+        if (this.abort.signal.aborted)
+            return;
+        this.abort.abort();
+        if (this.rolloverTimer)
+            clearTimeout(this.rolloverTimer);
+        for (const [viewer, timer] of this.retiringViewers) {
+            clearTimeout(timer);
+            viewer.close();
+        }
+        this.retiringViewers.clear();
+        this.viewer?.close();
+        this.viewer = undefined;
+        this.viewerPromise = undefined;
+        this.refcount = 0;
+        this.micSinkHolds = 0;
+        this.fireStreamEnded();
     }
 
     /**
@@ -1238,7 +1327,7 @@ export class LiveKitCameraStream {
         }
         this.dlog('SS:LiveKit rollover: pre-warming replacement session before token expiry.');
         const details = await this.getDetails();
-        const next = await startLiveKitViewer(details, this.console, this.debug, this.makeSinks(++this.genCounter));
+        const next = await startLiveKitViewer(details, this.console, this.debug, this.makeSinks(++this.genCounter), this.abort.signal);
         if (this.viewer !== oldViewer || this.refcount === 0) {
             next.close();
             return;
@@ -1262,7 +1351,10 @@ export class LiveKitCameraStream {
         }
         // Let the replacement deliver its first video (which flips the active source), then drop
         // the old session; closing it first would open a gap.
-        setTimeout(() => { try { oldViewer.close(); } catch { /* ignore */ } }, 2000);
+        this.retiringViewers.set(oldViewer, setTimeout(() => {
+            this.retiringViewers.delete(oldViewer);
+            try { oldViewer.close(); } catch { /* ignore */ }
+        }, 2000));
     }
 
     /**
@@ -1279,6 +1371,8 @@ export class LiveKitCameraStream {
      * the scheduled rollover leaves it unset and respects the backoff.
      */
     private async ensureViewer(force = false): Promise<LiveKitViewer> {
+        if (this.abort.signal.aborted)
+            throw new Error('LiveKit stream closed.');
         if (this.viewer && this.viewer.isHealthy())
             return this.viewer;
 
@@ -1294,7 +1388,11 @@ export class LiveKitCameraStream {
         if (!this.viewerPromise) {
             this.viewerPromise = (async () => {
                 const details = await this.getDetails(force);
-                const viewer = await startLiveKitViewer(details, this.console, this.debug, this.makeSinks(++this.genCounter));
+                const viewer = await startLiveKitViewer(details, this.console, this.debug, this.makeSinks(++this.genCounter), this.abort.signal);
+                if (this.abort.signal.aborted) {
+                    viewer.close();
+                    throw new Error('LiveKit stream closed.');
+                }
                 this.dlog('SS:LiveKit subscriber connected; bridging to Scrypted.',
                     'video=', viewer.videoCodec?.mimeType ?? false,
                     'audio=', viewer.audioCodec?.mimeType ?? false);
@@ -1316,12 +1414,21 @@ export class LiveKitCameraStream {
 
     async startSession(session: RTCSignalingSession): Promise<RTCSessionControl> {
         await this.ensureViewer(true);
+        if (this.abort.signal.aborted)
+            throw new Error('LiveKit stream closed.');
         this.refcount++;
+        let released = false;
+        const release = () => {
+            if (!released) {
+                released = true;
+                this.release();
+            }
+        };
         try {
-            return await bridgeToScryptedSession(session, this, this.console, () => this.release());
+            return await bridgeToScryptedSession(session, this, this.console, release);
         }
         catch (err) {
-            this.release();
+            release();
             throw err;
         }
     }
@@ -1335,6 +1442,8 @@ export class LiveKitCameraStream {
      */
     async acquireMicSink(): Promise<{ getTrack: () => MediaStreamTrack | undefined; release: () => void }> {
         const viewer = await this.ensureViewer();
+        if (this.abort.signal.aborted)
+            throw new Error('LiveKit stream closed.');
         this.refcount++;
         this.micSinkHolds++;
         let released = false;
@@ -1393,6 +1502,15 @@ async function bridgeToScryptedSession(
     // must be disposed on session end — otherwise each session permanently leaks a per-packet
     // callback writing into its dead tracks.
     const sessionDisposers: (() => void)[] = [];
+    let ended = false;
+    const control = new SimplisafeRTCSessionControl(() => {
+        ended = true;
+        for (const dispose of sessionDisposers.splice(0)) {
+            try { dispose(); } catch { /* ignore */ }
+        }
+        try { consumerPc.close().catch(() => { /* ignore */ }); } catch { /* ignore */ }
+        onEnd();
+    });
 
     // Outbound video, fed from the stream's stable relay (survives session rollovers).
     const videoOut = new MediaStreamTrack({ kind: 'video' });
@@ -1418,7 +1536,6 @@ async function bridgeToScryptedSession(
     // happens — that was corrupting the shared publisher after the first talk-back. Only the session
     // that currently owns the mic (claimMic) writes RTP: mixing two sessions into the one sender
     // corrupts it and breaks talk-back for everyone.
-    let micStarted = false;
     let micStarting = false;
     const micToken = {};
     consumerPc.onTrack.subscribe(track => {
@@ -1428,13 +1545,17 @@ async function bridgeToScryptedSession(
             // Take (or keep) exclusive ownership of the shared mic; bail if another session is talking.
             if (!stream.claimMic(micToken))
                 return;
-            if (!micStarting) {
+            if (ended)
+                return;
+            // A replacement viewer has its own publisher. Check that viewer's actual track,
+            // rather than retaining a successful-publication flag from the previous session.
+            if (!stream.getMicTrack() && !micStarting) {
                 micStarting = true;
                 stream.ensureMicTrack()
-                    .then(() => { micStarted = true; })
-                    .catch(err => console.warn('SS:LiveKit talk-back publish failed.', err));
+                    .catch(err => console.warn('SS:LiveKit talk-back publish failed.', err))
+                    .finally(() => { micStarting = false; });
             }
-            if (!micStarted)
+            if (!stream.getMicTrack())
                 return;
             // Forward into the shared mic track with monotonic sequence/timestamp rewriting.
             stream.writeMic(rtp);
@@ -1451,25 +1572,6 @@ async function bridgeToScryptedSession(
         video: { direction: 'recvonly' },
     };
 
-    // If the Scrypted consumer supplies its own offer, it must be the offering side; otherwise we
-    // (werift) offer and the consumer answers.
-    const options = session.options ?? await session.getOptions?.();
-    if (options?.offer)
-        await connectRTCSignalingClients(console, session, sessionSetup, weriftSession, consumerSetup);
-    else
-        await connectRTCSignalingClients(console, weriftSession, consumerSetup, session, sessionSetup);
-
-    const control = new SimplisafeRTCSessionControl(() => {
-        for (const dispose of sessionDisposers.splice(0)) {
-            try { dispose(); } catch { /* ignore */ }
-        }
-        try { consumerPc.close(); } catch { /* ignore */ }
-        // Release this consumer's hold on the shared LiveKit connection; the streamer tears the
-        // upstream down only when the last consumer leaves. The shared mic track is not torn down
-        // per session — it lives with the viewer and is closed when the last consumer leaves.
-        onEnd();
-    });
-
     consumerPc.connectionStateChange.subscribe(state => {
         if (state === 'failed' || state === 'closed')
             control.endSession().catch(() => { /* ignore */ });
@@ -1479,6 +1581,22 @@ async function bridgeToScryptedSession(
     sessionDisposers.push(stream.onStreamEnded(() => {
         control.endSession().catch(() => { /* ignore */ });
     }));
+
+    try {
+        // A consumer supplying its own offer must be the offering side.
+        const options = session.options ?? await session.getOptions?.();
+        if (ended)
+            throw new Error('SimpliSafe consumer session ended during negotiation.');
+        if (options?.offer)
+            await connectRTCSignalingClients(console, session, sessionSetup, weriftSession, consumerSetup);
+        else
+            await connectRTCSignalingClients(console, weriftSession, consumerSetup, session, sessionSetup);
+        if (ended)
+            throw new Error('SimpliSafe consumer session ended during negotiation.');
+    } catch (err) {
+        await control.endSession();
+        throw err;
+    }
 
     return control;
 }

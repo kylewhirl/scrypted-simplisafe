@@ -1126,6 +1126,9 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     private snapshotCache?: Buffer;
     private snapshotCacheTime = 0;
     private snapshotRefresh?: Promise<Buffer | undefined>;
+    private disposed = false;
+    private snapshotTimer?: NodeJS.Timeout;
+    private intercomGeneration = 0;
 
     constructor(
         nativeId: string,
@@ -1164,6 +1167,14 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     }
 
     dispose(): void {
+        if (this.disposed)
+            return;
+        this.disposed = true;
+        void this.stopIntercom();
+        this.liveKitStream?.close();
+        this.liveKitStream = undefined;
+        if (this.snapshotTimer)
+            clearTimeout(this.snapshotTimer);
         const current = SimplisafeCamera.instanceRegistry.get(this.nativeCameraId);
         if (current === this.instanceId) {
             SimplisafeCamera.instanceRegistry.delete(this.nativeCameraId);
@@ -1635,7 +1646,9 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
             // Seed/refresh the snapshot cache from the now-warm stream so the HomeKit thumbnail is
             // fresh and later idle snapshots answer instantly instead of cold-starting (and timing
             // out). The stream sends a keyframe on connect; give it a moment to arrive.
-            setTimeout(() => { this.getLiveKitSnapshot().catch(() => { /* ignore */ }); }, 3_000);
+            if (this.snapshotTimer)
+                clearTimeout(this.snapshotTimer);
+            this.snapshotTimer = setTimeout(() => { this.getLiveKitSnapshot().catch(() => { /* ignore */ }); }, 3_000);
             return control;
         } catch (err) {
             this.console.error(`Failed to start SimpliSafe WebRTC stream for ${this.nativeCameraId}.`, err);
@@ -1645,6 +1658,8 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
 
     /** One shared LiveKit connection per camera, fanned out to all Scrypted consumers. */
     private getLiveKitStream(cameraUuid: string): LiveKitCameraStream {
+        if (this.disposed)
+            throw new Error('SimpliSafe camera disposed.');
         if (!this.liveKitStream) {
             this.liveKitStream = new LiveKitCameraStream(async (force?: boolean) => {
                 const liveView = await this.api.getLiveView(cameraUuid, force);
@@ -1674,14 +1689,25 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
         }
 
         // Tear down any prior intercom session before starting a new one.
-        await this.stopIntercom();
+        const stopped = this.stopIntercom();
+        const generation = this.intercomGeneration;
+        await stopped;
+        const assertCurrent = () => {
+            if (this.disposed || generation !== this.intercomGeneration)
+                throw new Error('SimpliSafe intercom start cancelled.');
+        };
 
         const ffmpegInput = await mediaManager.convertMediaObjectToJSON<FFmpegInput>(media, ScryptedMimeTypes.FFmpegInput);
         const ffmpegPath = await mediaManager.getFFmpegPath();
 
         try {
+            assertCurrent();
             // Acquire the shared LiveKit talk-back sink (published once, reused across sessions).
             const sink = await this.getLiveKitStream(details.uuid).acquireMicSink();
+            if (this.disposed || generation !== this.intercomGeneration) {
+                sink.release();
+                throw new Error('SimpliSafe intercom start cancelled.');
+            }
             this.intercomCleanup = sink.release;
 
             // Bind a UDP socket so we can tell ffmpeg which port to emit Opus RTP to.
@@ -1693,6 +1719,7 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
                 socket.once('error', reject);
                 socket.bind(0, '127.0.0.1', () => resolve(socket.address().port));
             });
+            assertCurrent();
 
             socket.on('message', buf => {
                 try {
@@ -1728,22 +1755,31 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
                 env: ffmpegInput.env ? { ...process.env, ...ffmpegInput.env } : process.env,
             });
             this.intercomProcess = cp;
-            cp.on('error', err => this.console.error('SimpliSafe intercom ffmpeg error.', err));
+            const stopCurrent = () => {
+                if (this.intercomProcess === cp)
+                    this.stopIntercom().catch(() => { /* ignore */ });
+            };
+            cp.on('error', err => {
+                this.console.error('SimpliSafe intercom ffmpeg error.', err);
+                stopCurrent();
+            });
             cp.stderr?.on('data', data => {
                 if (this.getDebug())
                     this.console.log('SS:intercom ffmpeg', data.toString());
             });
-            cp.on('exit', () => { this.stopIntercom().catch(() => { /* ignore */ }); });
+            cp.on('exit', stopCurrent);
         }
         catch (err) {
             this.console.error(`Failed to start SimpliSafe talk-back for ${this.nativeCameraId}.`, err);
-            await this.stopIntercom();
+            if (generation === this.intercomGeneration)
+                await this.stopIntercom();
             throw err;
         }
     }
 
     async stopIntercom(): Promise<void> {
         this.logInstanceUsage('stopIntercom');
+        this.intercomGeneration++;
         try { this.intercomCleanup?.(); } catch { /* ignore */ }
         this.intercomCleanup = undefined;
         try { this.intercomProcess?.kill('SIGKILL'); } catch { /* ignore */ }
