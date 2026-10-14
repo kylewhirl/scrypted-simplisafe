@@ -1723,14 +1723,10 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
 
             socket.on('message', buf => {
                 try {
-                    // Resolve the track per packet: after a forced mid-talk session rollover the
-                    // shared mic lives on the replacement viewer, not the one at acquire time.
-                    const track = sink.getTrack();
-                    if (!track)
-                        return;
                     const pkt = RtpPacket.deSerialize(buf);
-                    pkt.header.payloadType = track.codec?.payloadType ?? 111;
-                    track.writeRtp(pkt);
+                    // The shared sink follows rollovers, unmutes on claim, and keeps WebRTC and
+                    // device intercom writers from corrupting one another's RTP stream.
+                    sink.writeRtp(pkt);
                 }
                 catch {
                     /* ignore malformed packet */

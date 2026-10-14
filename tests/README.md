@@ -15,6 +15,11 @@ races, legacy SimpliCam/SS002 stream and snapshot requests, discovery interfaces
 and doorbell event identifiers/state, host backoff/auth refresh, H264 keyframes, and RTP
 continuity.
 
+`dependency-reachability.test.cjs` also exercises the actual locked Werift ICE/STUN address,
+P256 key-agreement, certificate-generation and DTLS-signature primitives while making calls to
+the advised `ip.isPublic` and Elliptic ECDSA signer fail. This supports the advisory-specific
+reachability assessment; it does not replace a complete ICE/DTLS/TURN network acceptance test.
+
 These checks establish application behavior with synthetic metadata and signaling. They
 do not establish real camera compatibility, TURN/ICE reachability, FFmpeg TLS trust on a
 Scrypted installation, HomeKit playback/audio quality, or long-running hardware stability.

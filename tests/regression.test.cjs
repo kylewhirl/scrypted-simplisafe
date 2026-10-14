@@ -245,6 +245,67 @@ test('publisher failure closes failed peer and allows clean retry', async () => 
     assert.ok(h.peers.every(p => p.closed));
     assert.equal(h.timer.timers.size, 0);
 });
+for (const failure of ['answer', 'connection']) {
+    test(`publisher ${failure} failure clears the mic and republishes on retry`, async () => {
+        const h = liveHarness();
+        const viewer = await connect(h, () => h.startLiveKitViewer(details, quiet, () => false, { video() {}, audio() {} }));
+        await viewer.ensureMicTrack();
+        const publisher = h.peers[1];
+        if (failure === 'answer') {
+            publisher.setRemoteDescription = async () => { throw Error('fixture publisher answer failure'); };
+            h.sockets[0].signal({ case: 'answer', value: new protocol.SessionDescription({ type: 'answer', sdp: '' }) });
+            await flush();
+        } else {
+            publisher.connectionStateChange.emit('failed');
+        }
+        assert.equal(publisher.closed, true);
+        assert.equal(viewer.getMicTrack(), undefined);
+        await viewer.ensureMicTrack();
+        assert.equal(h.peers.length, 3);
+        viewer.close();
+        assert.equal(h.timer.timers.size, 0);
+    });
+}
+test('device mic sink shares ownership, unmutes after WebRTC, and rebases RTP', async () => {
+    const h = liveHarness();
+    const stream = new h.LiveKitCameraStream(async () => details, quiet, () => false);
+    const sink = await connect(h, () => stream.acquireMicSink());
+    const viewer = stream.viewer;
+    const sent = [];
+    viewer.getMicTrack().onReceiveRtp.subscribe(packet => sent.push({ ...packet.header }));
+    h.sockets[0].signal({ case: 'trackPublished', value: new protocol.TrackPublishedResponse({ track: new protocol.TrackInfo({ sid: 'fixture-mic', type: protocol.TrackType.AUDIO }) }) });
+    await flush();
+    assert.equal(viewer.claimMic({}), true);
+    viewer.writeMic({ header: { sequenceNumber: 1, timestamp: 1 } });
+    sink.writeRtp({ header: { sequenceNumber: 500, timestamp: 500 } });
+    assert.equal(sent.length, 1); // Another consumer owns the microphone.
+    h.timer.fire(800);
+    sink.writeRtp({ header: { sequenceNumber: 500, timestamp: 500 } });
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1].sequenceNumber, (sent[0].sequenceNumber + 1) & 0xffff);
+    assert.equal(sent[1].timestamp, (sent[0].timestamp + 960) >>> 0);
+    const mutes = h.sockets[0].sent.map(bytes => protocol.SignalRequest.fromBinary(bytes).message).filter(m => m.case === 'mute').map(m => m.value.muted);
+    assert.deepEqual(mutes, [true, false]);
+    sink.release();
+    assert.equal(h.timer.timers.size, 0);
+});
+test('late publisher negotiation rejection cannot clear its replacement', async () => {
+    const h = liveHarness();
+    const viewer = await connect(h, () => h.startLiveKitViewer(details, quiet, () => false, { video() {}, audio() {} }));
+    await viewer.ensureMicTrack();
+    const old = h.peers[1];
+    let rejectAnswer;
+    old.setRemoteDescription = () => new Promise((resolve, reject) => { rejectAnswer = reject; });
+    h.sockets[0].signal({ case: 'answer', value: new protocol.SessionDescription({ type: 'answer', sdp: '' }) });
+    await flush();
+    old.connectionStateChange.emit('failed');
+    const replacementTrack = await viewer.ensureMicTrack();
+    rejectAnswer(Error('late old answer failure')); await flush();
+    old.connectionStateChange.emit('closed');
+    assert.equal(viewer.getMicTrack(), replacementTrack);
+    assert.equal(h.peers[2].closed, undefined);
+    viewer.close();
+});
 test('rollover retains the consumer and republishes its mic on the new viewer', async () => {
     const h = liveHarness();
     const stream = new h.LiveKitCameraStream(async () => details, quiet, () => false);
@@ -345,7 +406,7 @@ test('late exit from old intercom does not stop the replacement', async () => {
     const h = mainHarness();
     const c = h.camera({ ...legacy, supportedFeatures: { providers: { webrtc: 'kvs' } } });
     let releases = 0;
-    c.liveKitStream = { acquireMicSink: async () => ({ release: () => releases++, getTrack: () => undefined }), close() {} };
+    c.liveKitStream = { acquireMicSink: async () => ({ release: () => releases++, writeRtp() {} }), close() {} };
     await c.startIntercom({ inputArguments: [] });
     await c.startIntercom({ inputArguments: [] });
     h.children[0].emit('exit', 0);
@@ -360,7 +421,7 @@ test('device disposal releases intercom resources and LiveKit stream', async () 
     const c = h.camera({ ...legacy, supportedFeatures: { providers: { webrtc: 'kvs' } } });
     let closed = 0;
     let releases = 0;
-    c.liveKitStream = { acquireMicSink: async () => ({ release: () => releases++, getTrack: () => undefined }), close: () => closed++ };
+    c.liveKitStream = { acquireMicSink: async () => ({ release: () => releases++, writeRtp() {} }), close: () => closed++ };
     await c.startIntercom({ inputArguments: [] });
     c.dispose(); await flush();
     assert.equal(closed, 1);
@@ -373,12 +434,22 @@ test('device disposal releases intercom resources and LiveKit stream', async () 
 test('simultaneous intercom starts cancel the superseded request', async () => {
     const h = mainHarness();
     const c = h.camera({ ...legacy, supportedFeatures: { providers: { webrtc: 'kvs' } } });
-    c.liveKitStream = { acquireMicSink: async () => ({ release() {}, getTrack: () => undefined }), close() {} };
+    c.liveKitStream = { acquireMicSink: async () => ({ release() {}, writeRtp() {} }), close() {} };
     const first = c.startIntercom({ inputArguments: [] });
     const second = c.startIntercom({ inputArguments: [] });
     await assert.rejects(first, /cancelled/);
     await second;
     assert.equal(h.children.length, 1);
+    c.dispose();
+});
+test('device UDP intercom forwards packets through the shared sink', async () => {
+    const h = mainHarness();
+    const c = h.camera({ ...legacy, supportedFeatures: { providers: { webrtc: 'kvs' } } });
+    let packets = 0;
+    c.liveKitStream = { acquireMicSink: async () => ({ release() {}, writeRtp: () => packets++ }), close() {} };
+    await c.startIntercom({ inputArguments: [] });
+    h.udp[0].emit('message', { header: { sequenceNumber: 1, timestamp: 1 } });
+    assert.equal(packets, 1);
     c.dispose();
 });
 test('legacy SimpliCam and SS002 doorbell preserve FLV and verified hostname snapshots', async () => {

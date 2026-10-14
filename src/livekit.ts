@@ -481,6 +481,8 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
     let publisherRemoteDescriptionSet = false;
     let publisherMicSender: any;
     const pendingPublisherCandidates: RTCIceCandidate[] = [];
+    let micPublish: Promise<MediaStreamTrack> | undefined;
+    let micTrackRef: MediaStreamTrack | undefined;
 
     // Mic mute state. The SimpliSafe app toggles its published microphone track muted<->unmuted per
     // talk; the camera keys its speaker off the unmute (mute->unmute) transition. We keep one
@@ -560,6 +562,25 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         }
     };
 
+    const resetPublisher = (failedPc: RTCPeerConnection) => {
+        // A late failure from a replaced publisher must not tear down its replacement.
+        if (publisherPc !== failedPc)
+            return;
+        publisherPc = undefined;
+        publisherMicSender = undefined;
+        publisherRemoteDescriptionSet = false;
+        pendingPublisherCandidates.length = 0;
+        micTrackRef = undefined;
+        micPublish = undefined;
+        micSid = undefined;
+        micOwner = undefined;
+        micMuted = false;
+        if (micMuteTimer)
+            clearTimeout(micMuteTimer);
+        stopTurnClients(failedPc);
+        try { failedPc.close().catch(() => { /* ignore */ }); } catch { /* ignore */ }
+    };
+
     const cleanup = () => {
         // Re-entrant: pc.close() below re-fires connectionStateChange('closed') into cleanup.
         if (closed)
@@ -577,9 +598,9 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         try { ws.terminate(); } catch { /* ignore */ }
         // close() is asynchronous in werift; observe its rejection as well as synchronous errors.
         try { pc?.close().catch(() => { /* ignore */ }); } catch { /* ignore */ }
-        try { publisherPc?.close().catch(() => { /* ignore */ }); } catch { /* ignore */ }
         stopTurnClients(pc);
-        stopTurnClients(publisherPc);
+        if (publisherPc)
+            resetPublisher(publisherPc);
         for (const cb of closedCallbacks.splice(0)) {
             try { cb(); } catch { /* ignore */ }
         }
@@ -707,6 +728,7 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         if (closed)
             return;
         let messageCase: string | undefined;
+        let signalingPublisher: RTCPeerConnection | undefined;
         try {
             const bytes = data instanceof Buffer ? new Uint8Array(data)
                 : data instanceof ArrayBuffer ? new Uint8Array(data)
@@ -766,7 +788,10 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
                         break;
                     }
                     const answer = msg.value;
-                    await publisherPc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+                    signalingPublisher = publisherPc;
+                    await signalingPublisher.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+                    if (publisherPc !== signalingPublisher)
+                        break;
                     publisherRemoteDescriptionSet = true;
                     for (const candidate of pendingPublisherCandidates.splice(0))
                         await publisherPc.addIceCandidate(candidate).catch(() => { /* ignore */ });
@@ -864,6 +889,8 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
                 console.warn('SS:LiveKit offer negotiation failed; restarting subscriber connection.');
                 cleanup();
             }
+            if (messageCase === 'answer' && signalingPublisher)
+                resetPublisher(signalingPublisher);
         }
     };
 
@@ -938,8 +965,6 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
     // sequence jump backwards and the camera would discard the packets as stale. `writeMic` rewrites
     // every packet's sequence/timestamp to our own monotonic counters so the stream stays continuous
     // across source switches, regardless of which session is talking.
-    let micPublish: Promise<MediaStreamTrack> | undefined;
-    let micTrackRef: MediaStreamTrack | undefined;
     let micSeq = Math.floor(Math.random() * 0xffff);
     let micTs = Math.floor(Math.random() * 0xffffffff);
     const writeMic = (rtp: RtpPacket): void => {
@@ -956,30 +981,34 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
             return Promise.reject(new Error('LiveKit stream closed.'));
         if (micPublish)
             return micPublish;
+        if (!publisherPc) {
+            publisherPc = new RTCPeerConnection({
+                iceServers: normalizeIceServers(joinIceServers),
+                bundlePolicy: 'max-bundle',
+                codecs: { audio: PUBLISH_AUDIO_CODECS },
+            });
+            publisherPc.onIceCandidate.subscribe(candidate => {
+                if (!candidate?.candidate)
+                    return;
+                send({
+                    case: 'trickle',
+                    value: new TrickleRequest({
+                        candidateInit: JSON.stringify(candidate.toJSON()),
+                        target: SignalTarget.PUBLISHER,
+                    }),
+                });
+            });
+            const createdPc = publisherPc;
+            publisherPc.connectionStateChange.subscribe(state => {
+                dlog('SS:LiveKit publisher connection state:', state);
+                if (state === 'failed' || state === 'closed')
+                    resetPublisher(createdPc);
+            });
+        }
+        const publishingPc = publisherPc;
         micPublish = (async () => {
-            if (!publisherPc) {
-                publisherPc = new RTCPeerConnection({
-                    iceServers: normalizeIceServers(joinIceServers),
-                    bundlePolicy: 'max-bundle',
-                    codecs: { audio: PUBLISH_AUDIO_CODECS },
-                });
-                publisherPc.onIceCandidate.subscribe(candidate => {
-                    if (!candidate?.candidate)
-                        return;
-                    send({
-                        case: 'trickle',
-                        value: new TrickleRequest({
-                            candidateInit: JSON.stringify(candidate.toJSON()),
-                            target: SignalTarget.PUBLISHER,
-                        }),
-                    });
-                });
-                publisherPc.connectionStateChange.subscribe(state =>
-                    dlog('SS:LiveKit publisher connection state:', state));
-            }
-
             const track = new MediaStreamTrack({ kind: 'audio', id: `mic-${Date.now()}` });
-            const micTransceiver = publisherPc.addTransceiver(track, { direction: 'sendonly' });
+            const micTransceiver = publishingPc.addTransceiver(track, { direction: 'sendonly' });
             // The 'answer' handler force-enables RED wrapping on this sender once negotiation settles
             // (werift otherwise leaves redRedundantPayloadType=0 and sends raw Opus mislabelled as RED).
             publisherMicSender = micTransceiver.sender;
@@ -999,11 +1028,11 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
                 }),
             });
 
-            const offer = await publisherPc.createOffer();
-            if (closed)
+            const offer = await publishingPc.createOffer();
+            if (closed || publisherPc !== publishingPc)
                 throw new Error('LiveKit stream closed.');
-            await publisherPc.setLocalDescription(offer);
-            if (closed)
+            await publishingPc.setLocalDescription(offer);
+            if (closed || publisherPc !== publishingPc)
                 throw new Error('LiveKit stream closed.');
             send({
                 case: 'offer',
@@ -1014,16 +1043,7 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
             return track;
         })();
         // Allow a retry on failure (e.g. transient publisher negotiation error).
-        micPublish.catch(() => {
-            stopTurnClients(publisherPc);
-            try { publisherPc?.close().catch(() => { /* ignore */ }); } catch { /* ignore */ }
-            publisherPc = undefined;
-            publisherMicSender = undefined;
-            publisherRemoteDescriptionSet = false;
-            pendingPublisherCandidates.length = 0;
-            micTrackRef = undefined;
-            micPublish = undefined;
-        });
+        micPublish.catch(() => resetPublisher(publishingPc));
         return micPublish;
     };
 
@@ -1436,17 +1456,18 @@ export class LiveKitCameraStream {
     /**
      * Acquire the shared talk-back sink for the device-level Intercom path (used by non-WebRTC
      * consumers). Ensures a connection exists (so talk-back works even if nothing is actively
-     * viewing) and holds a refcount for the duration. Returns an accessor for the shared mic
-     * track — resolved per call, because a forced mid-talk rollover swaps the viewer and the
-     * track published at acquire time goes dead — plus a release function that drops the refcount.
+     * viewing) and holds a refcount for the duration. Each write claims the current viewer's mic,
+     * unmutes it and rewrites RTP through the same shared path as WebRTC talk-back. The sink
+     * follows session rollovers and release drops its refcount.
      */
-    async acquireMicSink(): Promise<{ getTrack: () => MediaStreamTrack | undefined; release: () => void }> {
+    async acquireMicSink(): Promise<{ writeRtp: (rtp: RtpPacket) => void; release: () => void }> {
         const viewer = await this.ensureViewer();
         if (this.abort.signal.aborted)
             throw new Error('LiveKit stream closed.');
         this.refcount++;
         this.micSinkHolds++;
         let released = false;
+        const micToken = {};
         const release = () => {
             if (released)
                 return;
@@ -1456,7 +1477,22 @@ export class LiveKitCameraStream {
         };
         try {
             await viewer.ensureMicTrack();
-            return { getTrack: () => this.viewer?.getMicTrack(), release };
+            return {
+                writeRtp: rtp => {
+                    const current = this.viewer;
+                    if (released || !current?.claimMic(micToken))
+                        return;
+                    const track = current.getMicTrack();
+                    if (!track) {
+                        current.ensureMicTrack().catch(err =>
+                            this.dlog('SS:LiveKit intercom mic publish failed.', err));
+                        return;
+                    }
+                    rtp.header.payloadType = track.codec?.payloadType ?? 111;
+                    current.writeMic(rtp);
+                },
+                release,
+            };
         }
         catch (err) {
             release();
@@ -1612,11 +1648,8 @@ class SimplisafeRTCSessionControl implements RTCSessionControl {
     }
 
     async getRefreshAt(): Promise<number | void> {
-        // No forced refresh. LiveKit only validates the access token at join time; a connected
-        // participant is not disconnected when the token expires. Forcing a refresh would mean
-        // reconnecting the shared upstream, which would interrupt every current viewer. If the
-        // upstream ever does drop, the shared connection self-heals on the next stream request
-        // (each reconnect fetches a fresh token), so no periodic refresh is needed.
+        // The shared stream owns token-expiry rollover for all consumers. Asking Scrypted to
+        // refresh each consumer separately would unnecessarily renegotiate their peer connections.
         return undefined;
     }
 
