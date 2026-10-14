@@ -11,10 +11,26 @@ An unofficial [Scrypted](https://github.com/koush/scrypted) plugin that connects
 
 ## Features
 - Discovers SimpliSafe cameras and registers them as Scrypted camera devices automatically.
-- Streams H.264 video (up to each camera's native resolution) with AAC audio suitable for HomeKit, Google Home, and other Scrypted integrations.
-- Emits motion events in real time so you can trigger automations the moment a camera detects motion or a doorbell rings.
+- Streams video from both camera generations: the legacy SimpliSafe cloud endpoint (H.264 + AAC over FLV) and the WebRTC/LiveKit transport used by newer cameras.
+- Two-way audio (talk-back) on LiveKit cameras, exposed through the Scrypted `Intercom` interface and usable from HomeKit.
+- Emits motion events in real time, and reports doorbell presses as a `BinarySensor` on doorbell models.
 - Maintains OAuth refresh tokens on your behalf and recovers gracefully from rate limits and transient API errors.
 - Optional verbose logging and device cleanup tools to help with troubleshooting.
+
+### Camera generations
+SimpliSafe ships two different streaming stacks, and the plugin picks one per camera based on the
+capabilities the API advertises:
+
+| | Legacy cameras | Newer cameras (LiveKit) |
+| --- | --- | --- |
+| Transport | SimpliSafe cloud FLV endpoint | WebRTC via LiveKit |
+| Scrypted interfaces | `VideoCamera` | `RTCSignalingChannel`, `Intercom` |
+| Two-way audio | No | Yes |
+
+LiveKit cameras deliberately do **not** advertise `VideoCamera` — the FLV endpoint returns nothing
+for them, so `getVideoStream` throws and only the WebRTC path works. Scrypted's WebRTC/rebroadcast
+plugins layer a `VideoCamera` mixin on top of `RTCSignalingChannel`, which is what downstream
+consumers such as HomeKit and Home Assistant actually use.
 
 ## Prerequisites
 - A running Scrypted server (local or hosted) with permission to install custom plugins.
@@ -40,7 +56,7 @@ An unofficial [Scrypted](https://github.com/koush/scrypted) plugin that connects
    - For production, run `npm run scrypted-deploy` to upload the compiled bundle.
 4. Open the Scrypted Admin Console, enable the **SimpliSafe Cameras** plugin, and complete authentication (see below).
 
-Once authenticated, the plugin will enumerate your cameras and create one Scrypted device per camera. Each device implements the `Camera`, `VideoCamera`, and `MotionSensor` interfaces.
+Once authenticated, the plugin will enumerate your cameras and create one Scrypted device per camera. Every device implements `Camera`, `Settings`, `Online`, and `MotionSensor`. The streaming interface depends on the camera generation (`VideoCamera` for legacy, `RTCSignalingChannel` + `Intercom` for LiveKit — see [Camera generations](#camera-generations)), and doorbell models additionally implement `BinarySensor`.
 
 ## Authentication
 SimpliSafe requires OAuth sign-in through their hosted login page. The flow mirrors the process documented by the [homebridge-simplisafe3](https://github.com/homebridge-simplisafe3/homebridge-simplisafe3) project and follows these steps:
@@ -63,7 +79,8 @@ If authentication fails, reset the **Authorization Redirect URL** field and repe
 
 ## Usage Notes
 - Camera live streams offer multiple resolutions based on the SimpliSafe quality settings. Scrypted clients will automatically pick the best match.
-- Motion events arrive via SimpliSafe's realtime websocket and map to the `MotionSensor` interface. Automations can filter on doorbell presses vs. motion using Scrypted scripting templates.
+- Motion events arrive via SimpliSafe's realtime websocket and map to the `MotionSensor` interface. Doorbell presses arrive on the same websocket and map to `BinarySensor`, so automations can distinguish a press from motion without scripting.
+- Talk-back on LiveKit cameras publishes a microphone track back to the camera over the existing WebRTC session. SimpliSafe expires a LiveKit session roughly every 10 minutes; the plugin pre-warms a replacement and rolls over, deferring the swap while talk-back is active so audio is not cut off mid-sentence.
 - The plugin caches camera metadata to survive short-term API outages. Toggle debug logging to review what the SimpliSafe API is returning.
 - Set the environment variable `SIMPLISAFE_DEV_CLEAN=1` when running `npm run dev:logs` to remove stale Scrypted device entries created during development.
 
@@ -74,6 +91,7 @@ If authentication fails, reset the **Authorization Redirect URL** field and repe
 
 ### Project structure
 - `src/main.ts` – Core plugin implementation: OAuth manager, API client, camera device classes, and realtime event handling.
+- `src/livekit.ts` – WebRTC/LiveKit transport for newer cameras: signalling, track forwarding into Scrypted's peer connection, keyframe caching for snapshots, session rollover, and the talk-back publisher.
 - `src/types` – Type stubs for third-party libraries used during snapshot extraction.
 
 Pull requests that improve stability, add new device types, or enhance logging are welcome. Please open an issue describing your use case before submitting significant changes.

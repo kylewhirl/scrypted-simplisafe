@@ -12,28 +12,36 @@ import sdk, {
     DeviceState,
     DeviceProvider,
     FFmpegInput,
+    Intercom,
     MediaObject,
     MotionSensor,
     RequestMediaStreamOptions,
     RequestPictureOptions,
     ResponseMediaStreamOptions,
     ResponsePictureOptions,
+    RTCSessionControl,
+    RTCSignalingChannel,
+    RTCSignalingSession,
     ScryptedDeviceBase,
     ScryptedDeviceType,
     ScryptedInterface,
+    ScryptedMimeTypes,
     Setting,
     SettingValue,
     Settings,
     VideoCamera,
 } from '@scrypted/sdk';
+import { LiveKitCameraStream, LiveViewResponse } from './livekit';
+import { RtpPacket } from '@koush/werift';
 import axios, { AxiosError, AxiosInstance, AxiosRequestConfig } from 'axios';
 import axiosRetry from 'axios-retry';
+import { ChildProcess, spawn } from 'child_process';
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
-import dns from 'dns';
-const { lookup } = dns.promises;
+import dgram from 'dgram';
 import jpegExtract from 'jpeg-extract';
 import WebSocket, { RawData } from 'ws';
+import packageJson from '../package.json';
 
 const { deviceManager, mediaManager, systemManager } = sdk;
 
@@ -52,8 +60,24 @@ const SS_OAUTH_DEVICE_UUID = '0000007E-0000-1000-8000-0026BB765291';
 const subscriptionCacheTime = 3000;
 const cameraCacheTime = 15000;
 const rateLimitInitialInterval = 60_000;
-const rateLimitMaxInterval = 2 * 60 * 60 * 1000;
-const mediaHostTtl = 5 * 60 * 1000;
+// Keep the ceiling low. A blocked window suppresses every request to that host, so an overlong
+// cap turns a brief upstream fault into an outage that outlives it — the camera would stay dark
+// for hours after SimpliSafe recovered.
+const rateLimitMaxInterval = 5 * 60 * 1000;
+// SimpliSafe fronts app-hub.prd.aser.simplisafe.com with a Kong gateway that 403s requests whose
+// User-Agent starts with a lowercase SDK token — `axios/1.10.0` and `okhttp/4.9.0` are both
+// rejected, while `Axios/1.10.0`, `curl/8.4.0` and an absent UA all pass. Axios sets its own UA by
+// default, so without this every getLiveView() call is refused and WebRTC streaming is dead while
+// the rest of the plugin (api.simplisafe.com, which does not filter) keeps working. Do not remove;
+// if this string ever needs to change, re-test it against /live-view first.
+const SS_USER_AGENT = `scrypted-simplisafe/${packageJson.version}`;
+// Media requests carry the SimpliSafe bearer token, so they must go to the hostname with TLS
+// verification enabled — never to a resolved IP with verification disabled (MITM could steal the
+// token, which grants full account access including the alarm).
+const SS_MEDIA_HOST = 'media.simplisafe.com';
+// Recording providers known to serve the SimpliSafe cloud FLV streaming endpoint.
+// Add the value logged by SS:isUnsupported here once confirmed it works with the FLV path.
+const SUPPORTED_RECORDING_PROVIDERS = new Set<string>(['simplisafe']);
 const socketRetryInterval = 1000;
 const socketHeartbeatInterval = 60_000;
 const socketRetryBackoffCap = 60_000;
@@ -61,6 +85,7 @@ const RESOLUTION_INTERFACE: ScryptedInterface | string = (ScryptedInterface as a
 
 const ssOAuth: AxiosInstance = axios.create({
     baseURL: 'https://auth.simplisafe.com/oauth',
+    headers: { 'User-Agent': SS_USER_AGENT },
 });
 axiosRetry(ssOAuth, { retries: 3 });
 
@@ -95,6 +120,13 @@ interface SimplisafeCameraSettings {
 
 interface SimplisafeCameraProviders {
     recording?: string;
+    webrtc?: string;
+    live?: string;
+    allSupportedProviders?: {
+        webrtc?: string[];
+        recording?: string[];
+        live?: string[];
+    };
 }
 
 interface SimplisafeCameraSupportedFeatures {
@@ -147,6 +179,16 @@ interface SimplisafeRealtimeMessage {
     type?: string;
     data?: SimplisafeRealtimeEvent;
     [key: string]: unknown;
+}
+
+/**
+ * Newer SimpliSafe cameras stream over LiveKit (WebRTC) instead of the legacy FLV endpoint.
+ * SimpliSafe labels them with providers.webrtc === 'kvs' (typically with live === 'none'), but the
+ * live-view endpoint actually returns LiveKit connection details, not Amazon KVS.
+ */
+function isLiveKitCameraDetails(details: SimplisafeCameraDetails): boolean {
+    const providers = details.supportedFeatures?.providers;
+    return providers?.webrtc === 'kvs' || providers?.recording === 'kvs';
 }
 
 function normalizeIdSegment(value: string): string {
@@ -406,9 +448,11 @@ class SimplisafeApi extends EventEmitter {
     private subId?: string;
     private lastSubscription?: { id: string; data: any; timestamp: number };
     private cameraCache?: { data: SimplisafeCameraDetails[]; timestamp: number };
-    private isBlocked = false;
-    private nextAttempt = 0;
-    private nextBlockInterval = rateLimitInitialInterval;
+    // Backoff is tracked per host. api.simplisafe.com and app-hub.prd.aser.simplisafe.com are
+    // separate services; letting a failure on one suppress requests to the other is what turned a
+    // single refused endpoint into an outage of the whole integration.
+    private backoff = new Map<string, { nextAttempt: number; interval: number }>();
+    private liveViewRequests = new Map<string, Promise<LiveViewResponse>>();
     private socket?: WebSocket;
     private socketHeartbeat?: NodeJS.Timeout;
     private socketReconnect?: NodeJS.Timeout;
@@ -424,6 +468,7 @@ class SimplisafeApi extends EventEmitter {
         this.debug = debug;
         this.axios = axios.create({
             baseURL: 'https://api.simplisafe.com/v1',
+            headers: { 'User-Agent': SS_USER_AGENT },
         });
         axiosRetry(this.axios, { retries: 2 });
 
@@ -588,6 +633,9 @@ class SimplisafeApi extends EventEmitter {
     }
 
     private handleSocketMessage(raw: RawData): void {
+        if (this.debug) {
+            this.log.log(`SimpliSafe realtime: raw message: ${raw.toString()}`);
+        }
         let message: SimplisafeRealtimeMessage;
         try {
             message = JSON.parse(raw.toString());
@@ -629,17 +677,29 @@ class SimplisafeApi extends EventEmitter {
         }
 
         if (data.sid && this.subId && data.sid !== this.subId) {
+            if (this.debug) {
+                this.log.log(`SimpliSafe realtime: dropping event for other subscription sid=${data.sid} (ours=${this.subId}).`);
+            }
             return;
         }
 
         switch (data.eventCid) {
         case 1170:
+            if (this.debug) {
+                this.log.log(`SimpliSafe realtime: camera motion event payload: ${JSON.stringify(data)}`);
+            }
             this.emit(EVENT_TYPES.CAMERA_MOTION, data);
             break;
         case 1458:
+            if (this.debug) {
+                this.log.log(`SimpliSafe realtime: doorbell event payload: ${JSON.stringify(data)}`);
+            }
             this.emit(EVENT_TYPES.DOORBELL, data);
             break;
         default:
+            if (this.debug) {
+                this.log.log(`SimpliSafe realtime: unhandled event cid=${data.eventCid ?? 'unknown'} payload: ${JSON.stringify(data)}`);
+            }
             break;
         }
     }
@@ -729,6 +789,53 @@ class SimplisafeApi extends EventEmitter {
         return this.authManager.accessToken;
     }
 
+    /**
+     * Fetch the LiveKit live-view bundle for a newer SimpliSafe camera. Returns
+     * { liveKitDetails: { liveKitURL, userToken }, cameraStatus }. Uses the app-hub host rather
+     * than the standard api.simplisafe.com/v1 base (an absolute url overrides the axios baseURL).
+     */
+    async getLiveView(cameraUuid: string, force = false): Promise<LiveViewResponse> {
+        // Consumers restart aggressively on failure (the rebroadcast prebuffer retries every 5s), so
+        // collapse overlapping requests for the same camera into one upstream call. Mirrors the
+        // viewerPromise memoization in LiveKitCameraStream.ensureViewer.
+        const inflight = this.liveViewRequests.get(cameraUuid);
+        if (inflight)
+            return inflight;
+
+        const request = (async () => {
+            // Ensure the subscription/location id is resolved; getSubscription populates this.subId.
+            await this.getSubscription();
+            const locationId = this.subId;
+            if (!locationId) {
+                throw new Error('Unable to determine SimpliSafe location id for live view.');
+            }
+
+            const raw = await this.request<any>({
+                method: 'GET',
+                url: `https://app-hub.prd.aser.simplisafe.com/v2/cameras/${cameraUuid}/${locationId}/live-view`,
+            }, { force });
+
+            // Tolerate a wrapped envelope (e.g. { data: {...} }). The token is short-lived.
+            const body: LiveViewResponse = raw?.liveKitDetails ? raw
+                : raw?.data?.liveKitDetails ? raw.data
+                : raw;
+
+            if (this.debug) {
+                this.log.log(`SS:liveView ${cameraUuid} liveKitURL=${body?.liveKitDetails?.liveKitURL} cameraStatus=${body?.cameraStatus}`);
+            }
+
+            return body;
+        })();
+
+        this.liveViewRequests.set(cameraUuid, request);
+        try {
+            return await request;
+        }
+        finally {
+            this.liveViewRequests.delete(cameraUuid);
+        }
+    }
+
     async getCameras(forceRefresh = false): Promise<SimplisafeCameraDetails[]> {
         if (!forceRefresh && this.cameraCache && Date.now() - this.cameraCache.timestamp < cameraCacheTime) {
             if (this.debug) {
@@ -768,50 +875,138 @@ class SimplisafeApi extends EventEmitter {
         }
     }
 
-    private async request<T>(config: AxiosRequestConfig): Promise<T> {
-        if (this.isBlocked && Date.now() < this.nextAttempt) {
-            throw new RateLimitError('Blocking request: rate limited');
+    /**
+     * Host the backoff for this request is keyed on. A relative url resolves against the axios
+     * baseURL; getLiveView passes an absolute app-hub url.
+     */
+    private backoffKey(config: AxiosRequestConfig): string {
+        const url = config.url ?? '';
+        if (!/^https?:\/\//i.test(url))
+            return 'api.simplisafe.com';
+        try {
+            return new URL(url).host;
+        }
+        catch {
+            return 'api.simplisafe.com';
+        }
+    }
+
+    /**
+     * Log why a request failed. The response body carries the actual reason (and Kong's request_id,
+     * which SimpliSafe support can correlate); discarding it is what made a hard 403 look like rate
+     * limiting for weeks. Logged at warn/error so it is visible without the debug setting.
+     */
+    private logRequestFailure(config: AxiosRequestConfig, axiosError: AxiosError): void {
+        const method = (config.method ?? 'GET').toUpperCase();
+        const url = config.url ?? '';
+        const response = axiosError.response;
+        if (!response) {
+            this.log.warn(`SimpliSafe ${method} ${url} failed with no response.`, axiosError.message);
+            return;
         }
 
-        const accessToken = await this.getAccessToken();
-
+        const requestId = (response.data as any)?.request_id
+            ?? (response.headers as any)?.['x-kong-request-id'];
+        let body: string;
         try {
-            const response = await this.axios.request<T>({
+            body = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
+        }
+        catch {
+            body = '<unserializable>';
+        }
+        this.log.error(`SimpliSafe ${method} ${url} -> ${response.status} ${response.statusText}.`
+            + (requestId ? ` request_id=${requestId}.` : '')
+            + ` body=${(body ?? '').slice(0, 300)}`);
+    }
+
+    /**
+     * @param options.force ignore an active backoff window for one attempt. Used by user-initiated
+     * actions so pressing play retries immediately instead of failing until a timer happens to expire.
+     */
+    private async request<T>(config: AxiosRequestConfig, options?: { force?: boolean }): Promise<T> {
+        const key = this.backoffKey(config);
+        const backoff = this.backoff.get(key);
+        if (!options?.force && backoff && Date.now() < backoff.nextAttempt) {
+            const seconds = Math.ceil((backoff.nextAttempt - Date.now()) / 1000);
+            throw new RateLimitError(`Blocking request to ${key}: backing off for another ${seconds}s after a recent failure.`);
+        }
+
+        const send = async () => {
+            const accessToken = await this.getAccessToken();
+            return this.axios.request<T>({
                 ...config,
                 headers: {
                     ...config.headers,
                     Authorization: `${this.authManager.tokenType} ${accessToken}`,
                 },
             });
-            this.resetRateLimit();
+        };
+
+        try {
+            const response = await send();
+            this.resetRateLimit(key);
             return response.data;
-        } catch (error) {
+        }
+        catch (error) {
+            // Local failures (no access token, bad config) are not HTTP problems and must not be
+            // reported as rate limiting.
+            if (!axios.isAxiosError(error))
+                throw error;
+
             const axiosError = error as AxiosError;
+
+            // A 401 means the token went stale, not that the account is blocked. Refresh once and
+            // retry before giving up; on failure fall through to the 401 branch below.
+            if (axiosError.response?.status === 401) {
+                try {
+                    await this.authManager.refreshCredentials();
+                    const response = await send();
+                    this.resetRateLimit(key);
+                    return response.data;
+                }
+                catch {
+                    // fall through with the original 401
+                }
+            }
+
+            this.logRequestFailure(config, axiosError);
+
             if (!axiosError.response) {
-                this.setRateLimit();
+                this.setRateLimit(key);
                 throw new RateLimitError('SimpliSafe request failed: no response received.');
             }
 
-            if (axiosError.response.status === 403) {
-                this.setRateLimit();
-                throw new RateLimitError('SimpliSafe rejected the request (rate limited or auth failure).');
+            const status = axiosError.response.status;
+
+            // 429 is the only status that actually means rate limited.
+            if (status === 429) {
+                const retryAfter = Number((axiosError.response.headers as any)?.['retry-after']);
+                this.setRateLimit(key, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : undefined);
+                throw new RateLimitError(`SimpliSafe rate limited requests to ${key}.`);
             }
+
+            if (status === 401)
+                throw new Error('SimpliSafe rejected the stored credentials. Re-authenticate in the plugin settings.');
+
+            // A 403 is a deterministic refusal, not congestion. Backing off would only delay an
+            // identical failure, and suppressing the host would take unrelated features down with
+            // it — see SS_USER_AGENT for the gateway filter that lands here.
+            if (status === 403)
+                throw new Error(`SimpliSafe refused the request to ${key} (403 Forbidden). See the logged response body for the reason.`);
 
             throw axiosError.response.data ?? axiosError;
         }
     }
 
-    private resetRateLimit(): void {
-        this.isBlocked = false;
-        this.nextBlockInterval = rateLimitInitialInterval;
+    private resetRateLimit(key: string): void {
+        this.backoff.delete(key);
     }
 
-    private setRateLimit(): void {
-        this.isBlocked = true;
-        this.nextAttempt = Date.now() + this.nextBlockInterval;
-        if (this.nextBlockInterval < rateLimitMaxInterval) {
-            this.nextBlockInterval *= 2;
-        }
+    private setRateLimit(key: string, retryAfterMs?: number): void {
+        const previous = this.backoff.get(key)?.interval ?? 0;
+        const interval = retryAfterMs
+            ?? Math.min(previous ? previous * 2 : rateLimitInitialInterval, rateLimitMaxInterval);
+        this.backoff.set(key, { nextAttempt: Date.now() + interval, interval });
     }
 
     private async getUserId(): Promise<string> {
@@ -900,7 +1095,7 @@ class SimplisafeApi extends EventEmitter {
     }
 }
 
-class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Settings, MotionSensor, BinarySensor {
+class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Settings, MotionSensor, BinarySensor, RTCSignalingChannel, Intercom {
     private static instanceRegistry = new Map<string, string>();
     private readonly nativeCameraId: string;
     private readonly api: SimplisafeApi;
@@ -910,19 +1105,30 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     private readonly statusCallback: (ready: boolean, desiredOnline: boolean) => void;
     private readonly instanceId: string;
     private details?: SimplisafeCameraDetails;
+    private liveKitStream?: LiveKitCameraStream;
     private streamOptions?: ResponseMediaStreamOptions[];
     private pictureOptions?: ResponsePictureOptions[];
-    private mediaHost?: string;
-    private mediaHostTimestamp = 0;
     private simplisafeUuid?: string;
     private ready = false;
     private desiredOnline = true;
     private motionResetTimer?: NodeJS.Timeout;
     private readonly motionHoldDurationMs = 5_000;
-    motionDetected?: boolean;
+    // NOTE: motionDetected must NOT be re-declared as a class field here. Under
+    // useDefineForClassFields (target ESNext) a field declaration installs an own
+    // property that shadows ScryptedDeviceBase's prototype accessor, so assignments
+    // would never reach Scrypted device state (or HomeKit).
     motionDetectedTimestamp?: number;
     private doorbellResetTimer?: NodeJS.Timeout;
     private readonly doorbellHoldDurationMs = 5_000;
+    private intercomProcess?: ChildProcess;
+    private intercomSocket?: dgram.Socket;
+    private intercomCleanup?: () => void;
+    private snapshotCache?: Buffer;
+    private snapshotCacheTime = 0;
+    private snapshotRefresh?: Promise<Buffer | undefined>;
+    private disposed = false;
+    private snapshotTimer?: NodeJS.Timeout;
+    private intercomGeneration = 0;
 
     constructor(
         nativeId: string,
@@ -961,6 +1167,14 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     }
 
     dispose(): void {
+        if (this.disposed)
+            return;
+        this.disposed = true;
+        void this.stopIntercom();
+        this.liveKitStream?.close();
+        this.liveKitStream = undefined;
+        if (this.snapshotTimer)
+            clearTimeout(this.snapshotTimer);
         const current = SimplisafeCamera.instanceRegistry.get(this.nativeCameraId);
         if (current === this.instanceId) {
             SimplisafeCamera.instanceRegistry.delete(this.nativeCameraId);
@@ -999,6 +1213,9 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
             const cameras = await this.api.getCameras(forceRefresh);
             const details = cameras.find(camera => this.matchesCamera(camera));
             if (details) {
+                if (this.getDebug()) {
+                    this.console.log(`SS:rawCameraDetails ${this.nativeCameraId} ${JSON.stringify(details)}`);
+                }
                 this.updateDetails(details);
                 return details;
             }
@@ -1122,7 +1339,8 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
         this.logInstanceUsage('getVideoStreamOptions');
-        console.log('SS:getVideoStreamOptions', this.nativeCameraId);
+        if (this.getDebug())
+            this.console.log('SS:getVideoStreamOptions', this.nativeCameraId);
         try {
             const details = await this.ensureDetails();
 
@@ -1139,9 +1357,14 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
 
     async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
         this.logInstanceUsage('getVideoStream');
-        console.log('SS:getVideoStream', this.nativeCameraId, options);
+        if (this.getDebug())
+            this.console.log('SS:getVideoStream', this.nativeCameraId, options);
         try {
             const details = await this.ensureDetails();
+
+            if (this.isLiveKitCamera(details)) {
+                throw new Error(`${this.getDisplayName()} streams over WebRTC; use the RTCSignalingChannel path, not getVideoStream.`);
+            }
 
             if (this.isUnsupported(details)) {
                 throw new Error(`${this.getDisplayName()} does not support SimpliSafe cloud streaming.`);
@@ -1156,10 +1379,12 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
 
             const width = selected.video?.width ?? 1920;
             const accessToken = await this.api.getAccessToken();
-            const host = await this.getMediaHost();
-            const url = `https://${host}/v1/${details.uuid}/flv?x=${width}&audioEncoding=AAC`;
+            const url = `https://${SS_MEDIA_HOST}/v1/${details.uuid}/flv?x=${width}&audioEncoding=AAC`;
             const inputArguments = [
                 '-re',
+                // ffmpeg skips TLS certificate verification by default; the Authorization header
+                // below must not be exposed to a MITM.
+                '-tls_verify', '1',
                 '-headers',
                 `Authorization: Bearer ${accessToken}`,
                 '-i',
@@ -1183,9 +1408,22 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
 
     async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
         this.logInstanceUsage('takePicture');
-        try {
-            const details = await this.ensureDetails();
+        const details = await this.ensureDetails();
 
+        // LiveKit cameras have no snapshot endpoint. Instead of cold-starting the WebRTC->RTSP path
+        // on every request (slow, and prone to timing out as "Snapshot Failed" in HomeKit), serve a
+        // JPEG decoded from the live stream's latest keyframe, cached so idle cameras answer instantly.
+        if (this.isLiveKitCamera(details)) {
+            const jpeg = await this.getLiveKitSnapshot();
+            if (jpeg?.length) {
+                return this.createMediaObject(jpeg, 'image/jpeg');
+            }
+            // Nothing streamed yet and nothing cached: fall back to Scrypted's Snapshot plugin, which
+            // derives (and caches) a still from the rebroadcast prebuffer.
+            throw new Error(`${this.getDisplayName()} does not support direct snapshot capture; derived from the WebRTC stream.`);
+        }
+
+        try {
             if (this.isUnsupported(details)) {
                 throw new Error(`${this.getDisplayName()} does not support snapshots.`);
             }
@@ -1197,15 +1435,13 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
                 ?? 1920;
 
             const accessToken = await this.api.getAccessToken();
-            const host = await this.getMediaHost();
-            const snapshotUrl = `https://${host}/v1/${details.uuid}/mjpg?x=${width}&fr=1`;
+            const snapshotUrl = `https://${SS_MEDIA_HOST}/v1/${details.uuid}/mjpg?x=${width}&fr=1`;
 
             const image = await jpegExtract({
                 url: snapshotUrl,
                 headers: {
                     Authorization: `Bearer ${accessToken}`,
                 },
-                rejectUnauthorized: false,
             });
 
             return this.createMediaObject(image, 'image/jpeg');
@@ -1213,6 +1449,76 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
             this.console.error(`Failed to capture SimpliSafe snapshot for ${this.nativeCameraId}.`, err);
             throw err;
         }
+    }
+
+    /**
+     * Produce a still for a LiveKit (WebRTC) camera. When a stream is active we decode its latest
+     * H264 keyframe to JPEG and cache it; when idle we serve that cached JPEG immediately. This keeps
+     * HomeKit snapshots instant instead of cold-starting the WebRTC->RTSP path, which is slow and
+     * frequently times out as "Snapshot Failed" once the camera has gone idle for a while.
+     */
+    private async getLiveKitSnapshot(): Promise<Buffer | undefined> {
+        const keyframe = this.liveKitStream?.getKeyframe();
+        // Refresh from a live keyframe at most every few seconds; otherwise reuse the cached JPEG.
+        if (keyframe && Date.now() - this.snapshotCacheTime > 3_000) {
+            if (!this.snapshotRefresh) {
+                this.snapshotRefresh = this.decodeKeyframeToJpeg(keyframe)
+                    .then(jpeg => {
+                        if (jpeg?.length) {
+                            this.snapshotCache = jpeg;
+                            this.snapshotCacheTime = Date.now();
+                        }
+                        return jpeg;
+                    })
+                    .catch(err => {
+                        this.console.warn(`Failed to decode SimpliSafe keyframe snapshot for ${this.nativeCameraId}.`, err);
+                        return undefined;
+                    })
+                    .finally(() => { this.snapshotRefresh = undefined; });
+            }
+            // With no cached image yet, wait for the decode; otherwise serve the stale cache now and
+            // let the refresh finish in the background so this request stays fast.
+            if (!this.snapshotCache) {
+                await this.snapshotRefresh;
+            }
+        }
+        return this.snapshotCache;
+    }
+
+    /** Decode a single Annex-B H264 keyframe to a JPEG using ffmpeg. */
+    private async decodeKeyframeToJpeg(keyframe: Buffer): Promise<Buffer | undefined> {
+        const ffmpegPath = await mediaManager.getFFmpegPath();
+        return await new Promise<Buffer | undefined>((resolve, reject) => {
+            const args = [
+                '-hide_banner', '-loglevel', 'error',
+                '-f', 'h264',
+                '-i', 'pipe:0',
+                '-frames:v', '1',
+                '-f', 'mjpeg',
+                'pipe:1',
+            ];
+            const cp = spawn(ffmpegPath, args);
+            const out: Buffer[] = [];
+            const err: Buffer[] = [];
+            const timer = setTimeout(() => {
+                try { cp.kill('SIGKILL'); } catch { /* ignore */ }
+                reject(new Error('SimpliSafe snapshot decode timed out.'));
+            }, 5_000);
+            cp.stdout.on('data', d => out.push(d));
+            cp.stderr.on('data', d => err.push(d));
+            cp.on('error', e => { clearTimeout(timer); reject(e); });
+            cp.on('close', code => {
+                clearTimeout(timer);
+                const jpeg = Buffer.concat(out);
+                if (jpeg.length)
+                    resolve(jpeg);
+                else
+                    reject(new Error(`ffmpeg snapshot decode failed (code ${code}): ${Buffer.concat(err).toString().trim()}`));
+            });
+            cp.stdin.on('error', () => { /* ignore EPIPE if ffmpeg exits before we finish writing */ });
+            cp.stdin.write(keyframe);
+            cp.stdin.end();
+        });
     }
 
     async getPictureOptions(): Promise<ResponsePictureOptions[]> {
@@ -1294,27 +1600,6 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
         return height;
     }
 
-    private async getMediaHost(): Promise<string> {
-        const now = Date.now();
-        if (!this.mediaHost || now - this.mediaHostTimestamp > mediaHostTtl) {
-            try {
-                const result = await lookup('media.simplisafe.com');
-                this.mediaHost = result.address;
-                this.mediaHostTimestamp = now;
-            } catch (err) {
-                if (!this.mediaHost) {
-                    this.console.warn('Unable to resolve media.simplisafe.com, falling back to hostname.', err);
-                    this.mediaHost = 'media.simplisafe.com';
-                    this.mediaHostTimestamp = now;
-                } else {
-                    this.console.warn('Unable to resolve media.simplisafe.com, using cached host.', err);
-                }
-            }
-        }
-
-        return this.mediaHost!;
-    }
-
     private getCameraName(details: SimplisafeCameraDetails): string {
         return details.cameraSettings?.cameraName || details.name || `Camera ${details.uuid}`;
     }
@@ -1326,9 +1611,177 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
         return `Camera ${this.nativeCameraId}`;
     }
 
+    /**
+     * Newer SimpliSafe cameras stream over LiveKit (WebRTC), reported as providers.webrtc === 'kvs'
+     * (and typically live === 'none'), instead of the legacy FLV endpoint.
+     */
+    isLiveKitCamera(details: SimplisafeCameraDetails): boolean {
+        return isLiveKitCameraDetails(details);
+    }
+
     private isUnsupported(details: SimplisafeCameraDetails): boolean {
-        return details.supportedFeatures?.providers?.recording !== undefined
-            && details.supportedFeatures.providers.recording !== 'simplisafe';
+        // LiveKit cameras are supported via the WebRTC/RTCSignalingChannel path, not FLV.
+        if (this.isLiveKitCamera(details)) {
+            return false;
+        }
+        const provider = details.supportedFeatures?.providers?.recording;
+        const unsupported = provider !== undefined && !SUPPORTED_RECORDING_PROVIDERS.has(provider);
+        if (unsupported && this.getDebug()) {
+            this.console.log(
+                `SS:isUnsupported ${this.getDisplayName()} recordingProvider=${JSON.stringify(provider)} ` +
+                `supportedFeatures=${JSON.stringify(details.supportedFeatures)}`);
+        }
+        return unsupported;
+    }
+
+    async startRTCSignalingSession(session: RTCSignalingSession): Promise<RTCSessionControl | undefined> {
+        this.logInstanceUsage('startRTCSignalingSession');
+        const details = await this.ensureDetails();
+        if (!this.isLiveKitCamera(details)) {
+            throw new Error(`${this.getDisplayName()} does not support WebRTC streaming.`);
+        }
+
+        try {
+            const control = await this.getLiveKitStream(details.uuid).startSession(session);
+            // Seed/refresh the snapshot cache from the now-warm stream so the HomeKit thumbnail is
+            // fresh and later idle snapshots answer instantly instead of cold-starting (and timing
+            // out). The stream sends a keyframe on connect; give it a moment to arrive.
+            if (this.snapshotTimer)
+                clearTimeout(this.snapshotTimer);
+            this.snapshotTimer = setTimeout(() => { this.getLiveKitSnapshot().catch(() => { /* ignore */ }); }, 3_000);
+            return control;
+        } catch (err) {
+            this.console.error(`Failed to start SimpliSafe WebRTC stream for ${this.nativeCameraId}.`, err);
+            throw err;
+        }
+    }
+
+    /** One shared LiveKit connection per camera, fanned out to all Scrypted consumers. */
+    private getLiveKitStream(cameraUuid: string): LiveKitCameraStream {
+        if (this.disposed)
+            throw new Error('SimpliSafe camera disposed.');
+        if (!this.liveKitStream) {
+            this.liveKitStream = new LiveKitCameraStream(async (force?: boolean) => {
+                const liveView = await this.api.getLiveView(cameraUuid, force);
+                const liveKit = liveView.liveKitDetails;
+                if (!liveKit?.liveKitURL || !liveKit?.userToken) {
+                    throw new Error(`${this.getDisplayName()} live-view response did not include LiveKit details.`);
+                }
+                if (this.getDebug()) {
+                    this.console.log(`SS:liveView ${this.nativeCameraId} liveKitURL=${liveKit.liveKitURL} cameraStatus=${liveView.cameraStatus}`);
+                }
+                return liveKit;
+            }, this.console, this.getDebug);
+        }
+        return this.liveKitStream;
+    }
+
+    /**
+     * Two-way audio (talk-back). Scrypted/HomeKit hands us the return audio as an FFmpegInput; we
+     * transcode it to Opus RTP, feed it to a werift track, and publish that track upstream to
+     * LiveKit over the shared participant connection.
+     */
+    async startIntercom(media: MediaObject): Promise<void> {
+        this.logInstanceUsage('startIntercom');
+        const details = await this.ensureDetails();
+        if (!this.isLiveKitCamera(details)) {
+            throw new Error(`${this.getDisplayName()} does not support two-way audio.`);
+        }
+
+        // Tear down any prior intercom session before starting a new one.
+        const stopped = this.stopIntercom();
+        const generation = this.intercomGeneration;
+        await stopped;
+        const assertCurrent = () => {
+            if (this.disposed || generation !== this.intercomGeneration)
+                throw new Error('SimpliSafe intercom start cancelled.');
+        };
+
+        const ffmpegInput = await mediaManager.convertMediaObjectToJSON<FFmpegInput>(media, ScryptedMimeTypes.FFmpegInput);
+        const ffmpegPath = await mediaManager.getFFmpegPath();
+
+        try {
+            assertCurrent();
+            // Acquire the shared LiveKit talk-back sink (published once, reused across sessions).
+            const sink = await this.getLiveKitStream(details.uuid).acquireMicSink();
+            if (this.disposed || generation !== this.intercomGeneration) {
+                sink.release();
+                throw new Error('SimpliSafe intercom start cancelled.');
+            }
+            this.intercomCleanup = sink.release;
+
+            // Bind a UDP socket so we can tell ffmpeg which port to emit Opus RTP to.
+            const socket = dgram.createSocket('udp4');
+            this.intercomSocket = socket;
+            // An unhandled dgram 'error' would surface as an uncaughtException and kill the plugin.
+            socket.on('error', err => this.console.error('SimpliSafe intercom socket error.', err));
+            const port = await new Promise<number>((resolve, reject) => {
+                socket.once('error', reject);
+                socket.bind(0, '127.0.0.1', () => resolve(socket.address().port));
+            });
+            assertCurrent();
+
+            socket.on('message', buf => {
+                try {
+                    const pkt = RtpPacket.deSerialize(buf);
+                    // The shared sink follows rollovers, unmutes on claim, and keeps WebRTC and
+                    // device intercom writers from corrupting one another's RTP stream.
+                    sink.writeRtp(pkt);
+                }
+                catch {
+                    /* ignore malformed packet */
+                }
+            });
+
+            const args = [
+                ...ffmpegInput.inputArguments!,
+                '-vn',
+                '-acodec', 'libopus',
+                '-ac', '2',
+                '-ar', '48000',
+                '-application', 'lowdelay',
+                '-f', 'rtp',
+                '-payload_type', '111',
+                `rtp://127.0.0.1:${port}`,
+            ];
+            if (this.getDebug())
+                this.console.log('SS:startIntercom ffmpeg', ffmpegPath, args.join(' '));
+
+            const cp = spawn(ffmpegPath, args, {
+                env: ffmpegInput.env ? { ...process.env, ...ffmpegInput.env } : process.env,
+            });
+            this.intercomProcess = cp;
+            const stopCurrent = () => {
+                if (this.intercomProcess === cp)
+                    this.stopIntercom().catch(() => { /* ignore */ });
+            };
+            cp.on('error', err => {
+                this.console.error('SimpliSafe intercom ffmpeg error.', err);
+                stopCurrent();
+            });
+            cp.stderr?.on('data', data => {
+                if (this.getDebug())
+                    this.console.log('SS:intercom ffmpeg', data.toString());
+            });
+            cp.on('exit', stopCurrent);
+        }
+        catch (err) {
+            this.console.error(`Failed to start SimpliSafe talk-back for ${this.nativeCameraId}.`, err);
+            if (generation === this.intercomGeneration)
+                await this.stopIntercom();
+            throw err;
+        }
+    }
+
+    async stopIntercom(): Promise<void> {
+        this.logInstanceUsage('stopIntercom');
+        this.intercomGeneration++;
+        try { this.intercomCleanup?.(); } catch { /* ignore */ }
+        this.intercomCleanup = undefined;
+        try { this.intercomProcess?.kill('SIGKILL'); } catch { /* ignore */ }
+        this.intercomProcess = undefined;
+        try { this.intercomSocket?.close(); } catch { /* ignore */ }
+        this.intercomSocket = undefined;
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -1349,7 +1802,9 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
     private readonly cameraDetails = new Map<string, SimplisafeCameraDetails>();
     private readonly nativeIdToUuid = new Map<string, string>();
     private readonly uuidToNativeId = new Map<string, string>();
+    private readonly identifierToNativeIds = new Map<string, Set<string>>();
     private readonly currentNativeIds = new Set<string>();
+    private readonly deviceCreations = new Map<string, Promise<SimplisafeCamera>>();
     private readonly readinessTasks = new Map<string, Promise<void>>();
     private readonly upgradedNativeIds = new Set<string>();
     private readonly readinessStorageKey = 'cameraReadiness';
@@ -1413,17 +1868,60 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         this.uuidToNativeId.delete(uuid.toLowerCase());
     }
 
+    private registerCameraIdentifiers(nativeId: string, details: SimplisafeCameraDetails): void {
+        const normalizedNativeId = this.normalizeNativeId(nativeId);
+        this.unregisterCameraIdentifiers(normalizedNativeId);
+        const identifiers: (string | undefined)[] = [
+            (details as any)?.serialNumber,
+            (details as any)?.serial,
+            (details as any)?.deviceSerial,
+            (details as any)?.macAddress,
+            (details as any)?.mac,
+            details.uuid,
+        ];
+        for (const identifier of identifiers) {
+            if (typeof identifier !== 'string') {
+                continue;
+            }
+            const trimmed = identifier.trim();
+            if (!trimmed) {
+                continue;
+            }
+            for (const key of new Set([trimmed.toLowerCase(), normalizeIdSegment(trimmed)])) {
+                if (!key) {
+                    continue;
+                }
+                let nativeIds = this.identifierToNativeIds.get(key);
+                if (!nativeIds) {
+                    nativeIds = new Set<string>();
+                    this.identifierToNativeIds.set(key, nativeIds);
+                }
+                nativeIds.add(normalizedNativeId);
+            }
+        }
+    }
+
+    private unregisterCameraIdentifiers(nativeId: string): void {
+        const normalizedNativeId = this.normalizeNativeId(nativeId);
+        for (const [key, nativeIds] of this.identifierToNativeIds) {
+            if (nativeIds.delete(normalizedNativeId) && nativeIds.size === 0) {
+                this.identifierToNativeIds.delete(key);
+            }
+        }
+    }
+
     private handleCameraMotionEvent(event: SimplisafeRealtimeEvent): void {
         const nativeIds = this.resolveNativeIdsFromEvent(event);
         if (nativeIds.length === 0) {
+            const identifier = event.sensorSerial
+                || event.cameraSerial
+                || event.serial
+                || event.deviceSerial
+                || event.cameraUuid
+                || event.uuid;
+            this.console.warn(`SimpliSafe motion event could not be matched to a camera. identifier=${identifier ?? 'unknown'}`);
             if (this.debug) {
-                const identifier = event.sensorSerial
-                    || event.cameraSerial
-                    || event.serial
-                    || event.deviceSerial
-                    || event.cameraUuid
-                    || event.uuid;
-                this.console.warn(`SimpliSafe motion event could not be matched to a camera. identifier=${identifier ?? 'unknown'}`);
+                this.console.warn(`Unmatched motion event payload: ${JSON.stringify(event)}`);
             }
             return;
         }
@@ -1456,13 +1954,27 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
 
         const resolved = new Set<string>();
         for (const candidate of candidates) {
+            // The event may carry the nativeId itself, a bare serial/uuid, or a
+            // serial that only matches after full segment normalization.
             const normalized = this.normalizeNativeId(candidate);
             if (this.cameraDetails.has(normalized)) {
                 resolved.add(normalized);
             }
+            const prefixed = `simplisafe-camera-${normalizeIdSegment(candidate)}`;
+            if (this.cameraDetails.has(prefixed)) {
+                resolved.add(prefixed);
+            }
             const mapped = this.uuidToNativeId.get(candidate) ?? this.uuidToNativeId.get(candidate.toLowerCase());
             if (mapped) {
                 resolved.add(mapped);
+            }
+            for (const key of new Set([normalized, normalizeIdSegment(candidate)])) {
+                const indexed = this.identifierToNativeIds.get(key);
+                if (indexed) {
+                    for (const nativeId of indexed) {
+                        resolved.add(nativeId);
+                    }
+                }
             }
         }
 
@@ -1609,18 +2121,31 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
             return;
         }
 
+        const liveKit = isLiveKitCameraDetails(details);
         const doorbell = isDoorbellCamera(details);
         const interfaces: (ScryptedInterface | string)[] = [
             ScryptedInterface.Camera,
-            ScryptedInterface.VideoCamera,
             ScryptedInterface.Settings,
             RESOLUTION_INTERFACE,
             ScryptedInterface.Online,
             ScryptedInterface.MotionSensor,
         ];
 
+        // Legacy cameras always advertise VideoCamera, without waiting for the readiness probe.
+        // LiveKit cameras stream over WebRTC (RTCSignalingChannel) and getVideoStream throws for
+        // them, so advertising VideoCamera would hand consumers a dead FLV path.
+        if (!liveKit) {
+            interfaces.push(ScryptedInterface.VideoCamera);
+        }
+
         if (doorbell) {
             interfaces.push(ScryptedInterface.BinarySensor);
+        }
+
+        if (liveKit) {
+            interfaces.push(ScryptedInterface.RTCSignalingChannel);
+            // LiveKit cameras support two-way audio by publishing a mic track upstream.
+            interfaces.push(ScryptedInterface.Intercom);
         }
 
         const name = details.cameraSettings?.cameraName
@@ -1733,6 +2258,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         }
 
         this.cameraDetails.set(normalized, details);
+        this.registerCameraIdentifiers(normalized, details);
         this.pendingRemoval.delete(normalized);
 
         if (details.uuid) {
@@ -1832,7 +2358,9 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         this.persistCameraReadiness();
         device.markReady();
         await this.refreshDeviceDescriptor(normalized);
-        console.log('SS: camera now ready, advertising VideoCamera:', normalized);
+        // VideoCamera is advertised unconditionally for legacy cameras now, so this probe only
+        // gates the Online state, not the interface list.
+        this.console.log(`SimpliSafe readiness: ${normalized} passed the streaming probe.`);
     }
 
     private async initialize(): Promise<void> {
@@ -1868,6 +2396,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                     this.console.warn(`Duplicate cached SimpliSafe camera nativeId detected: ${nativeId}. Overwriting existing entry.`);
                 }
                 this.cameraDetails.set(nativeId, camera);
+                this.registerCameraIdentifiers(nativeId, camera);
                 if (camera.uuid) {
                     this.nativeIdToUuid.set(nativeId, camera.uuid);
                     this.associateUuidWithNativeId(camera.uuid, nativeId);
@@ -1944,7 +2473,11 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 this.cachedDescriptors.set(normalized, stored);
                 const key = this.computeDescriptorKey(stored);
                 this.lastPublished.set(normalized, key);
-                if (stored.interfaces.includes(ScryptedInterface.VideoCamera) || stored.interfaces.includes('VideoCamera')) {
+                const streamingReady = stored.interfaces.includes(ScryptedInterface.VideoCamera)
+                    || stored.interfaces.includes('VideoCamera')
+                    || stored.interfaces.includes(ScryptedInterface.RTCSignalingChannel)
+                    || stored.interfaces.includes('RTCSignalingChannel');
+                if (streamingReady) {
                     this.upgradedNativeIds.add(normalized);
                     if (!this.cameraReady.has(normalized)) {
                         this.cameraReady.set(normalized, true);
@@ -1967,9 +2500,22 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
             const doorbell = details ? isDoorbellCamera(details) : descriptor.type === ScryptedDeviceType.Doorbell;
             const correctedType = doorbell ? ScryptedDeviceType.Doorbell : ScryptedDeviceType.Camera;
 
+            // Cached descriptors are republished before the first sync, so cameraDetails is
+            // usually still empty here; fall back to the persisted interface list to tell
+            // LiveKit cameras apart.
+            const liveKit = details
+                ? isLiveKitCameraDetails(details)
+                : descriptor.interfaces.some(i => i === ScryptedInterface.RTCSignalingChannel || i === 'RTCSignalingChannel');
+
             let interfaces = descriptor.interfaces;
-            if (!interfaces.includes(ScryptedInterface.VideoCamera) && !interfaces.includes('VideoCamera')) {
+
+            // Legacy cameras always advertise VideoCamera; LiveKit cameras must never do so,
+            // since getVideoStream throws for them and only the WebRTC path works.
+            const hasVideoCamera = interfaces.some(i => i === ScryptedInterface.VideoCamera || i === 'VideoCamera');
+            if (!liveKit && !hasVideoCamera) {
                 interfaces = [...interfaces, ScryptedInterface.VideoCamera];
+            } else if (liveKit && hasVideoCamera) {
+                interfaces = interfaces.filter(i => i !== ScryptedInterface.VideoCamera && i !== 'VideoCamera');
             }
 
             // Always ensure BinarySensor is consistent with doorbell status regardless
@@ -2053,6 +2599,20 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
             return existing;
         }
 
+        // Scrypted can request the same device concurrently. createDevice awaits (initialize/sync)
+        // between the cache check and construction, so without memoization both callers would
+        // construct and the duplicate-instance guard would throw for the loser.
+        let creation = this.deviceCreations.get(normalized);
+        if (!creation) {
+            creation = this.createDevice(nativeId, normalized).finally(() => {
+                this.deviceCreations.delete(normalized);
+            });
+            this.deviceCreations.set(normalized, creation);
+        }
+        return creation;
+    }
+
+    private async createDevice(nativeId: string, normalized: string): Promise<SimplisafeCamera> {
         let lookupNativeId = normalized;
 
         if (!this.cameraDetails.has(lookupNativeId)) {
@@ -2080,12 +2640,21 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
             }
         }
 
+        // A concurrent caller may have created this device under an alias while we awaited (the
+        // memoization above only dedupes identical requested ids, and legacy ids redirect here).
+        // Everything from this check to construction is synchronous, so this closes the race.
+        const concurrentlyCreated = this.devices.get(lookupNativeId);
+        if (concurrentlyCreated) {
+            return concurrentlyCreated;
+        }
+
         let details = this.cameraDetails.get(lookupNativeId);
         let simplisafeUuid = this.nativeIdToUuid.get(lookupNativeId);
 
         if (!details) {
             details = buildPlaceholderCameraDetails(lookupNativeId, undefined, undefined, simplisafeUuid);
             this.cameraDetails.set(lookupNativeId, details);
+            this.registerCameraIdentifiers(lookupNativeId, details);
             if (!simplisafeUuid && details.uuid) {
                 simplisafeUuid = details.uuid;
                 this.nativeIdToUuid.set(lookupNativeId, simplisafeUuid);
@@ -2335,6 +2904,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 }
                 this.nativeIdToUuid.delete(legacy);
                 this.cameraDetails.delete(legacy);
+                this.unregisterCameraIdentifiers(legacy);
                 this.cameraReady.delete(legacy);
                 this.cameraDesiredOnline.delete(legacy);
                 this.cameraLastOnline.delete(legacy);
