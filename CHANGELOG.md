@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.11 — 2026-10-17
+
+- Document the per-camera HomeKit workaround verified on a legacy SS001: FFmpeg RTP
+  delivery with Transcode Video, including resource costs, fresh-session validation,
+  and rollback steps.
+- Clarify that plugin updates do not apply these HomeKit settings automatically, and
+  that API online status does not guarantee a usable video stream.
+
+This is a documentation-only patch release. Runtime behavior and dependencies are unchanged.
+
+
 ## 0.1.10 — 2026-10-14
 
 - Add LiveKit/WebRTC streaming for supported newer SimpliSafe cameras, including outdoor

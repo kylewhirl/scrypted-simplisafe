@@ -84,6 +84,32 @@ If authentication fails, reset the **Authorization Redirect URL** field and repe
 - The plugin caches camera metadata to survive short-term API outages. Toggle debug logging to review what the SimpliSafe API is returning.
 - Set the environment variable `SIMPLISAFE_DEV_CLEAN=1` when running `npm run dev:logs` to remove stale Scrypted device entries created during development.
 
+## HomeKit troubleshooting for legacy cameras
+
+If a legacy camera (such as an SS001 SimpliCam) streams in Scrypted but HomeKit closes
+live view immediately or displays a failed-camera icon, try these settings on that
+camera's **HomeKit** settings page:
+
+1. Set **RTP Sender** to **FFmpeg**.
+2. In **Debug Mode**, enable **Transcode Video**.
+3. Save the settings, close the Home camera view, and open it again. Check that the
+   video continues moving, then close and reopen it to verify a fresh session.
+
+These are settings in Scrypted's HomeKit plugin. Installing or updating this SimpliSafe
+plugin does not apply them automatically. Keep the change scoped to the affected camera;
+there is no need to remove the camera, reset authentication, or repeat HomeKit pairing.
+
+This combination restored sustained HomeKit playback for a physical SS001 whose direct
+FLV stream decoded successfully. FFmpeg RTP delivery alone did not resolve that case.
+Transcoding adds CPU and memory use during viewing, so use it as a compatibility workaround
+and check the server's resources. To undo the workaround, clear **Transcode Video** and
+restore the previous **RTP Sender** value (normally **Default**).
+
+See Scrypted's [HomeKit troubleshooting guide](https://docs.scrypted.app/homekit-troubleshooting.html)
+for transcoding and network checks. A successful HTTP response or an API status of `online`
+does not establish that a camera is delivering decodable video. If the camera also fails
+in the SimpliSafe app, restore its power/network connection before changing HomeKit settings.
+
 ## Development
 - `npm run scrypted-vscode-launch` – Build and deploy the plugin to the Scrypted host defined in `.vscode/settings.json`, then attach the VS Code debugger.
 - `npm run dev:logs` – Continuously stream Scrypted logs for rapid troubleshooting (requires `SIMPLISAFE_DEV_CLEAN=1` to enable automatic cleanup).
